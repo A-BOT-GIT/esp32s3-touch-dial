@@ -15,6 +15,9 @@ NATIVE_USB_HINTS = [
     "ESP32-S3",
     "ESPRESSIF",
     "VID_303A",
+    "ID 303A:1001",
+    "303A:1001",
+    "USB JTAG/SERIAL DEBUG UNIT",
     "TOUCH DIAL",
     "DIAL",
     "PRODUCT=ESP32-S3 TOUCH DIAL",
@@ -49,6 +52,13 @@ class CaptureAnalysis:
     usb_mode: str | None
     control_channel: str | None
     hid_supported: bool | None
+    dial_backend: str | None
+    dial_backend_ready: bool | None
+    backend_status: str | None
+    ble_connected: bool | None
+    ble_advertising: bool | None
+    last_backend_error: str | None
+    last_send_type: str | None
     board_bridge_present: bool
     board_bridge_instance_ids: list[str]
     native_usb_ports: list[str]
@@ -174,6 +184,13 @@ def parse_hid_status_fields(hid_status_lines: list[str]) -> dict[str, Any]:
             "usb_mode": None,
             "control_channel": None,
             "hid_supported": None,
+            "dial_backend": None,
+            "dial_backend_ready": None,
+            "backend_status": None,
+            "ble_connected": None,
+            "ble_advertising": None,
+            "last_backend_error": None,
+            "last_send_type": None,
             "usb_started": None,
             "hid_ready": None,
         }
@@ -199,10 +216,32 @@ def parse_hid_status_fields(hid_status_lines: list[str]) -> dict[str, Any]:
     if hid_ready_raw in {"0", "1"}:
         hid_ready = hid_ready_raw == "1"
 
+    dial_backend_ready_raw = extract("dial_backend_ready")
+    dial_backend_ready = None
+    if dial_backend_ready_raw in {"0", "1"}:
+        dial_backend_ready = dial_backend_ready_raw == "1"
+
+    ble_connected_raw = extract("ble_connected")
+    ble_connected = None
+    if ble_connected_raw in {"0", "1"}:
+        ble_connected = ble_connected_raw == "1"
+
+    ble_advertising_raw = extract("ble_advertising")
+    ble_advertising = None
+    if ble_advertising_raw in {"0", "1"}:
+        ble_advertising = ble_advertising_raw == "1"
+
     return {
         "usb_mode": extract("usb_mode"),
         "control_channel": extract("control_channel"),
         "hid_supported": hid_supported,
+        "dial_backend": extract("dial_backend"),
+        "dial_backend_ready": dial_backend_ready,
+        "backend_status": extract("backend_status"),
+        "ble_connected": ble_connected,
+        "ble_advertising": ble_advertising,
+        "last_backend_error": extract("last_backend_error"),
+        "last_send_type": extract("last_send_type"),
         "usb_started": usb_started,
         "hid_ready": hid_ready,
     }
@@ -228,7 +267,9 @@ def analyze_capture_dir(capture_dir: Path) -> CaptureAnalysis:
     log_text = read_text(capture_dir / "capture.log")
     host_pnp = read_text(capture_dir / "host_pnp_usb.txt")
     host_cim = read_text(capture_dir / "host_cim_pnp.txt")
-    host_all = host_pnp + "\n" + host_cim
+    host_lsusb = read_text(capture_dir / "host_lsusb.txt")
+    host_usb_devices = read_text(capture_dir / "host_usb_devices.txt")
+    host_all = "\n".join([host_pnp, host_cim, host_lsusb, host_usb_devices])
 
     parsed_log = parse_capture_log(log_text)
     selected_port = (
@@ -273,8 +314,12 @@ def analyze_capture_dir(capture_dir: Path) -> CaptureAnalysis:
     likely_native_usb_enumerated = False
     for line in native_candidates:
         upper = line.upper()
-        if "VID_303A" in upper or "ESP32" in upper or "TOUCH DIAL" in upper:
+        if "VID_303A" in upper or "303A:1001" in upper or "ESP32" in upper or "ESPRESSIF" in upper or "TOUCH DIAL" in upper:
             likely_native_usb_enumerated = True
+
+    ble_connect_count = len(re.findall(r">BLE connected\b", log_text))
+    ble_disconnect_count = len(re.findall(r">BLE disconnected\b", log_text))
+    ble_connection_storm = ble_connect_count > 0 and ble_disconnect_count > 0
 
     conclusions: list[str] = []
     if expected_board_port:
@@ -300,18 +345,60 @@ def analyze_capture_dir(capture_dir: Path) -> CaptureAnalysis:
         conclusions.append(f"固件 HID 状态：{last.strip()}。")
     if hid_status_fields["control_channel"]:
         conclusions.append(f"固件当前控制通道={hid_status_fields['control_channel']}。")
+    if hid_status_fields["dial_backend"]:
+        conclusions.append(f"固件当前 Dial backend={hid_status_fields['dial_backend']}。")
     if hid_status_fields["usb_mode"] == "hwcdc" and hid_status_fields["hid_supported"] is False:
         conclusions.append("当前固件运行在 hwcdc 模式：native USB CDC 可用于命令/日志，但自定义 TinyUSB HID 不会启用；如需 HID，请切回 USBMode=default,CDCOnBoot=cdc。")
     elif hid_status_fields["usb_mode"] == "tinyusb" and hid_status_fields["hid_supported"] is True:
         conclusions.append("当前固件运行在 tinyusb 模式，且自定义 HID 路径已启用。")
+    if hid_status_fields["dial_backend"] == "ble_hid_dial":
+        conclusions.append("BLE Dial backend 骨架已启用。")
+        if hid_status_fields["ble_advertising"] is True:
+            conclusions.append("BLE advertising 已启动。")
+        if hid_status_fields["ble_connected"] is True:
+            conclusions.append("BLE 链路当前处于已连接状态。")
+        if hid_status_fields["last_send_type"] and hid_status_fields["last_send_type"] != "none":
+            conclusions.append(f"最近一次 backend 发送类型={hid_status_fields['last_send_type']}。")
+            send_type = hid_status_fields["last_send_type"]
+            if send_type == "rotate_right":
+                conclusions.append("最近一次 BLE backend 发送是右旋相对增量。")
+            elif send_type == "rotate_left":
+                conclusions.append("最近一次 BLE backend 发送是左旋相对增量。")
+            elif send_type == "press":
+                conclusions.append("最近一次 BLE backend 发送是按压脉冲。")
+        if hid_status_fields["last_backend_error"] and hid_status_fields["last_backend_error"] != "none":
+            conclusions.append(f"最近一次 backend 错误={hid_status_fields['last_backend_error']}。")
+            backend_error = hid_status_fields["last_backend_error"]
+            if backend_error == "report_missing":
+                conclusions.append("BLE input report 特征缺失，发送路径当前不可用。")
+            elif backend_error == "not_ready":
+                conclusions.append("BLE backend 尚未 ready，最近一次发送被跳过。")
+            elif backend_error == "rate_limited_rotate":
+                conclusions.append("BLE rotate 发送因节流被跳过。")
+            elif backend_error == "rate_limited_press":
+                conclusions.append("BLE press 发送因节流被跳过。")
+        if ble_connection_storm:
+            conclusions.append("BLE 连接存在反复 connect/disconnect 抖动。")
+            if hid_status_fields["last_backend_error"] == "not_ready" and hid_status_fields["last_send_type"] in {"rotate_left", "rotate_right", "press"}:
+                conclusions.append("旋钮事件已到达 BLE backend，但因链路未稳定/未 ready 尚未进入 Windows 可用输入路径。")
+        if hid_status_fields["dial_backend_ready"] is True:
+            if hid_status_fields["backend_status"]:
+                conclusions.append(f"当前 backend 已 ready（backend_status={hid_status_fields['backend_status']}）。")
+            else:
+                conclusions.append("当前 backend 已 ready。")
+        elif hid_status_fields["dial_backend_ready"] is False:
+            if hid_status_fields["backend_status"]:
+                conclusions.append(f"当前 backend 尚未 ready（backend_status={hid_status_fields['backend_status']}）。")
+            else:
+                conclusions.append("当前 backend 尚未 ready。")
     if usb_started_count == 0 and hid_ready_count == 0 and hid_status_lines and hid_status_fields["hid_supported"] is not False:
         conclusions.append("固件侧未观察到 USB started / HID ready，说明原生 USB 尚未被主机成功枚举。")
     if bridge_present:
         conclusions.append("Windows 已看到 CH343 串口桥（VID_1A86&PID_55D3）。")
     if not likely_native_usb_enumerated:
-        conclusions.append("Windows 枚举信息中未发现明确的 ESP32/Espressif/VID_303A/Touch Dial 原生 USB 设备。")
+        conclusions.append("主机枚举信息中未发现明确的 ESP32/Espressif/VID_303A/Touch Dial 原生 USB 设备。")
     if likely_native_usb_enumerated:
-        conclusions.append("Windows 枚举信息中发现疑似原生 USB 设备候选，需要进一步核对。")
+        conclusions.append("主机枚举信息中发现疑似原生 USB 设备候选，需要进一步核对。")
 
     return CaptureAnalysis(
         capture_dir=str(capture_dir),
@@ -332,6 +419,13 @@ def analyze_capture_dir(capture_dir: Path) -> CaptureAnalysis:
         usb_mode=hid_status_fields["usb_mode"],
         control_channel=hid_status_fields["control_channel"],
         hid_supported=hid_status_fields["hid_supported"],
+        dial_backend=hid_status_fields["dial_backend"],
+        dial_backend_ready=hid_status_fields["dial_backend_ready"],
+        backend_status=hid_status_fields["backend_status"],
+        ble_connected=hid_status_fields["ble_connected"],
+        ble_advertising=hid_status_fields["ble_advertising"],
+        last_backend_error=hid_status_fields["last_backend_error"],
+        last_send_type=hid_status_fields["last_send_type"],
         board_bridge_present=bridge_present,
         board_bridge_instance_ids=bridge_instance_ids,
         native_usb_ports=native_usb_ports,
@@ -382,6 +476,13 @@ def render_report(analyses: list[CaptureAnalysis], diff_info: dict[str, Any]) ->
         lines.append(f"  usb_mode: {item.usb_mode}")
         lines.append(f"  control_channel: {item.control_channel}")
         lines.append(f"  hid_supported: {item.hid_supported}")
+        lines.append(f"  dial_backend: {item.dial_backend}")
+        lines.append(f"  dial_backend_ready: {item.dial_backend_ready}")
+        lines.append(f"  backend_status: {item.backend_status}")
+        lines.append(f"  ble_connected: {item.ble_connected}")
+        lines.append(f"  ble_advertising: {item.ble_advertising}")
+        lines.append(f"  last_backend_error: {item.last_backend_error}")
+        lines.append(f"  last_send_type: {item.last_send_type}")
         lines.append(f"  board_bridge_present: {item.board_bridge_present}")
         lines.append(f"  likely_native_usb_enumerated: {item.likely_native_usb_enumerated}")
         if item.hid_status_lines:
@@ -419,9 +520,9 @@ def render_report(analyses: list[CaptureAnalysis], diff_info: dict[str, Any]) ->
     elif valid_runs and not hid_ok:
         lines.append("- 所有有效抓取都未出现 USB started / HID ready。")
     if not native_ok:
-        lines.append("- 所有抓取的 Windows 枚举信息里都未发现明确的 ESP32/Espressif/VID_303A/Touch Dial 原生 USB 设备。")
+        lines.append("- 所有抓取的主机枚举信息里都未发现明确的 ESP32/Espressif/VID_303A/Touch Dial 原生 USB 设备。")
     if native_ok and not valid_runs:
-        lines.append("- 主机枚举已发现 VID_303A 原生 USB 设备，说明 ESP32-S3 native USB 已经被 Windows 看到。")
+        lines.append("- 主机枚举已发现 VID_303A 原生 USB 设备，说明 ESP32-S3 native USB 已经被当前主机看到。")
     if valid_runs and not hid_ok and not native_ok:
         lines.append("- 综合判断：当前只看到 CH343 串口桥，未看到 ESP32-S3 原生 USB 链路；问题仍在 native USB 物理连接/接线/接口路径。")
     lines.append("")
