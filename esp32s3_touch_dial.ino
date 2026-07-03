@@ -22,6 +22,13 @@
 #include <math.h>
 #if ARDUINO_USB_MODE
 #include "HWCDC.h"
+#if defined(CONFIG_BLUEDROID_ENABLED)
+#include "BLEAdvertising.h"
+#include "BLEDevice.h"
+#include "BLEHIDDevice.h"
+#include "BLEServer.h"
+#include <esp_random.h>
+#endif
 #else
 #include "USB.h"
 #include "USBHID.h"
@@ -88,6 +95,8 @@ constexpr unsigned long ACK_TIMEOUT_MS = 60000;
 constexpr unsigned long TOUCH_POLL_MS = 20;
 constexpr unsigned long TOUCH_RAW_DEBUG_MS = 500;
 constexpr unsigned long VOLUME_SEND_MIN_MS = 50;
+constexpr unsigned long BLE_ROTATE_SEND_MIN_MS = 40;
+constexpr unsigned long BLE_PRESS_SEND_MIN_MS = 120;
 constexpr unsigned long TAP_MAX_MS = 550;
 constexpr unsigned long LONG_PRESS_MS = 850;
 constexpr unsigned long PRESS_DEBOUNCE_MS = 300;
@@ -97,16 +106,14 @@ constexpr uint8_t DIAL_BUTTON_PRESS = 0x01;
 constexpr int8_t DIAL_ROTATE_RIGHT = 1;
 constexpr int8_t DIAL_ROTATE_LEFT = -1;
 
-const char* dialBackendName() {
-#if !ARDUINO_USB_MODE
-  return "usb_hid_tinyusb";
-#else
-  return "ble_hid_planned";
-#endif
-}
+// BLE HID identity — extracted constants for minimal tuning rounds.
+// Do not change behavior unless the descriptor profile selector is switched.
+// Round 1 appearance tuning: use HID_JOYSTICK (0x03C3, ESP_BLE_APPEARANCE_HID_JOYSTICK)
+// instead of GENERIC_HID (0x03C0). A dial is a single-axis relative controller
+// closest to a joystick among the BLE HID subtypes defined in BLEHIDDevice.h.
+// If this makes Windows behavior worse, revert to 0x03C0 before the next round.
+constexpr uint16_t BLE_DIAL_APPEARANCE = 0x03C3;  // HID_JOYSTICK
 
-#if !ARDUINO_USB_MODE
-USBHID HID;
 static const uint8_t dial_report_descriptor[] = {
   0x05, 0x01,        // Usage Page (Generic Desktop)
   0x09, 0x0E,        // Usage (System Multi-Axis Controller)
@@ -133,21 +140,218 @@ static const uint8_t dial_report_descriptor[] = {
   0xC0               // End Collection
 };
 
+// Returns the report descriptor for the currently selected profile.
+// Currently only Baseline is implemented; VariantA/VariantB are stubs for future rounds.
+static const uint8_t* getDialReportDescriptor(uint16_t& outLen) {
+  outLen = sizeof(dial_report_descriptor);
+  return dial_report_descriptor;
+}
+
+bool dialBackendReady();
+bool bleDialBackendBegun = false;
+#if ARDUINO_USB_MODE && defined(CONFIG_BLUEDROID_ENABLED)
+enum class BleDialState : uint8_t {
+  Uninitialized = 0,
+  Initializing,
+  Advertising,
+  ConnectedIdle,
+  SendingRotate,
+  SendingPress,
+  RestartingAdvertising,
+  Error,
+};
+
+BLEServer* bleDialServer = nullptr;
+BLEHIDDevice* bleDialHid = nullptr;
+BLEAdvertising* bleDialAdvertising = nullptr;
+BLECharacteristic* bleDialInputReport = nullptr;
+esp_bd_addr_t bleDialRandomAddress = {0};
+bool bleDialConnected = false;
+bool bleDialAdvertisingActive = false;
+BleDialState bleDialState = BleDialState::Uninitialized;
+const char* bleLastBackendError = "none";
+const char* bleLastSendType = "none";
+unsigned long bleLastSendMs = 0;
+unsigned long bleLastRotateSendMs = 0;
+unsigned long bleLastPressSendMs = 0;
+#endif
+
+const char* dialBackendName() {
+#if !ARDUINO_USB_MODE
+  return "usb_hid_tinyusb";
+#else
+  return "ble_hid_dial";
+#endif
+}
+
+#if ARDUINO_USB_MODE && defined(CONFIG_BLUEDROID_ENABLED)
+void fillBleDialRandomAddress(esp_bd_addr_t addr) {
+  uint32_t r0 = esp_random();
+  uint32_t r1 = esp_random();
+  addr[0] = static_cast<uint8_t>((r0 & 0x3F) | 0xC0);
+  addr[1] = static_cast<uint8_t>((r0 >> 8) & 0xFF);
+  addr[2] = static_cast<uint8_t>((r0 >> 16) & 0xFF);
+  addr[3] = static_cast<uint8_t>((r0 >> 24) & 0xFF);
+  addr[4] = static_cast<uint8_t>(r1 & 0xFF);
+  addr[5] = static_cast<uint8_t>((r1 >> 8) & 0xFF);
+}
+
+const char* bleDialStateName() {
+  switch (bleDialState) {
+    case BleDialState::Uninitialized:
+      return "uninitialized";
+    case BleDialState::Initializing:
+      return "initializing";
+    case BleDialState::Advertising:
+      return "advertising";
+    case BleDialState::ConnectedIdle:
+      return "connected_idle";
+    case BleDialState::SendingRotate:
+      return "sending_rotate";
+    case BleDialState::SendingPress:
+      return "sending_press";
+    case BleDialState::RestartingAdvertising:
+      return "restarting_advertising";
+    case BleDialState::Error:
+      return "error";
+    default:
+      return "unknown";
+  }
+}
+
+void setBleDialState(BleDialState nextState) {
+  bleDialState = nextState;
+}
+
+void setBleLastBackendError(const char* error) {
+  bleLastBackendError = (error && error[0]) ? error : "none";
+}
+
+void setBleLastSendType(const char* sendType) {
+  bleLastSendType = (sendType && sendType[0]) ? sendType : "none";
+  bleLastSendMs = millis();
+}
+
+void resetBleDialSendTracking() {
+  bleLastSendType = "none";
+  bleLastBackendError = "none";
+  bleLastSendMs = 0;
+  bleLastRotateSendMs = 0;
+  bleLastPressSendMs = 0;
+}
+
+void logBleEvent(const char* event, const char* detail = nullptr) {
+  if (detail && detail[0]) {
+    DIAL_SERIAL.printf(">BLE %s %s\n", event, detail);
+  } else {
+    DIAL_SERIAL.printf(">BLE %s\n", event);
+  }
+}
+
+void restoreBleDialStableState() {
+  if (bleDialConnected) {
+    setBleDialState(BleDialState::ConnectedIdle);
+  } else if (bleDialAdvertisingActive) {
+    setBleDialState(BleDialState::Advertising);
+  }
+}
+
+bool bleDialSendReleaseReport() {
+  if (bleDialInputReport == nullptr) {
+    setBleLastBackendError("report_missing");
+    restoreBleDialStableState();
+    return false;
+  }
+
+  uint8_t releaseReport[2] = {0, 0};
+  bleDialInputReport->setValue(releaseReport, sizeof(releaseReport));
+  bleDialInputReport->notify();
+  return true;
+}
+
+bool bleDialIsPressSendType(const char* sendType) {
+  return sendType && sendType[0] == 'p';
+}
+
+bool bleDialSendReport(uint8_t buttons, int8_t delta, const char* sendType) {
+  setBleLastSendType(sendType);
+  if (!dialBackendReady() || bleDialInputReport == nullptr) {
+    const char* skipReason = bleDialInputReport == nullptr ? "report_missing" : "not_ready";
+    setBleLastBackendError(skipReason);
+    logBleEvent("report", bleDialInputReport == nullptr ? "skip reason=report_missing" : "skip reason=not_ready");
+    restoreBleDialStableState();
+    return false;
+  }
+
+  bool isPress = bleDialIsPressSendType(sendType);
+  unsigned long now = millis();
+  unsigned long* lastSendSlot = isPress ? &bleLastPressSendMs : &bleLastRotateSendMs;
+  unsigned long minInterval = isPress ? BLE_PRESS_SEND_MIN_MS : BLE_ROTATE_SEND_MIN_MS;
+  if (*lastSendSlot != 0 && now - *lastSendSlot < minInterval) {
+    const char* skipReason = isPress ? "rate_limited_press" : "rate_limited_rotate";
+    setBleLastBackendError(skipReason);
+    logBleEvent("report", isPress ? "skip reason=rate_limited_press" : "skip reason=rate_limited_rotate");
+    restoreBleDialStableState();
+    return false;
+  }
+
+  *lastSendSlot = now;
+  setBleLastBackendError("none");
+  uint8_t report[2] = {buttons, static_cast<uint8_t>(delta)};
+  bleDialInputReport->setValue(report, sizeof(report));
+  bleDialInputReport->notify();
+  bool released = bleDialSendReleaseReport();
+  restoreBleDialStableState();
+  return released;
+}
+#endif
+
+const char* dialBackendStatus() {
+#if !ARDUINO_USB_MODE
+  return dialBackendReady() ? "ready" : "waiting_for_usb_host";
+#elif defined(CONFIG_BLUEDROID_ENABLED)
+  return bleDialStateName();
+#else
+  return bleDialBackendBegun ? "bt_stack_unavailable" : "stub_uninitialized";
+#endif
+}
+
+const char* dialBackendNote() {
+#if !ARDUINO_USB_MODE
+  return "usb_tinyusb_custom_hid";
+#elif defined(CONFIG_BLUEDROID_ENABLED)
+  if (bleDialConnected) return "ble_dial_link_established";
+  if (bleDialAdvertisingActive) return "ble_dial_advertising";
+  if (bleDialState == BleDialState::Initializing) return "ble_dial_initializing";
+  if (bleDialState == BleDialState::Error) return bleLastBackendError;
+  return "ble_dial_backend_waiting_for_connection";
+#else
+  return "ble_stack_disabled_in_build";
+#endif
+}
+
+#if !ARDUINO_USB_MODE
+USBHID HID;
+
 class DialHIDDevice : public USBHIDDevice {
  public:
   DialHIDDevice() {
     static bool initialized = false;
     if (!initialized) {
       initialized = true;
-      HID.addDevice(this, sizeof(dial_report_descriptor));
+      uint16_t descLen = 0;
+      getDialReportDescriptor(descLen);
+      HID.addDevice(this, descLen);
     }
   }
 
   void begin() { HID.begin(); }
 
   uint16_t _onGetDescriptor(uint8_t* buffer) override {
-    memcpy(buffer, dial_report_descriptor, sizeof(dial_report_descriptor));
-    return sizeof(dial_report_descriptor);
+    uint16_t descriptorLen = 0;
+    const uint8_t* desc = getDialReportDescriptor(descriptorLen);
+    memcpy(buffer, desc, descriptorLen);
+    return descriptorLen;
   }
 
   bool sendReport(uint8_t buttons, int8_t delta) {
@@ -157,6 +361,38 @@ class DialHIDDevice : public USBHIDDevice {
 };
 
 DialHIDDevice dialHid;
+#elif defined(CONFIG_BLUEDROID_ENABLED)
+void printUsbHidStatus(const char* reason);
+extern bool usbHidReadySeen;
+
+class DialBleServerCallbacks : public BLEServerCallbacks {
+ public:
+  void onConnect(BLEServer* pServer) override {
+    (void)pServer;
+    bleDialConnected = true;
+    bleDialAdvertisingActive = false;
+    resetBleDialSendTracking();
+    setBleDialState(BleDialState::ConnectedIdle);
+    usbHidReadySeen = false;
+    logBleEvent("connected");
+    printUsbHidStatus("ble_connect");
+  }
+
+  void onDisconnect(BLEServer* pServer) override {
+    bleDialConnected = false;
+    usbHidReadySeen = false;
+    resetBleDialSendTracking();
+    setBleDialState(BleDialState::RestartingAdvertising);
+    if (pServer) {
+      pServer->startAdvertising();
+      bleDialAdvertisingActive = true;
+      setBleDialState(BleDialState::Advertising);
+    }
+    logBleEvent("disconnected");
+    logBleEvent("advertising", "restart");
+    printUsbHidStatus("ble_disconnect");
+  }
+};
 #endif
 
 Adafruit_GC9A01A tft(PIN_LCD_CS,
@@ -209,6 +445,21 @@ bool sEncSwitchWasLow = false;
 constexpr char USB_PRODUCT_NAME[] = "ESP32-S3 Touch Dial";
 constexpr char USB_MANUFACTURER_NAME[] = "zza";
 constexpr uint16_t USB_FW_VERSION_BCD = 0x0100;
+
+// BLE HID descriptor profile switch — change here to test identity variant.
+enum class BleDialDescriptorProfile : uint8_t {
+  Baseline = 0,   // current: System Multi-Axis Controller + Dial
+  VariantA = 1,   // future: more conservative HID shape
+  VariantB = 2,   // future: another variant
+};
+constexpr BleDialDescriptorProfile BLE_DIAL_DESCRIPTOR_PROFILE = BleDialDescriptorProfile::Baseline;
+
+// BLE HID device info — extracted for metadata tuning rounds.
+constexpr uint8_t  BLE_PNP_SIG     = 0x02;    // 0x02 = USB
+constexpr uint16_t BLE_PNP_VID     = 0x303A;   // Espressif
+constexpr uint16_t BLE_PNP_PID     = 0x1001;
+constexpr uint8_t  BLE_HID_COUNTRY = 0x00;    // Not localized
+constexpr uint8_t  BLE_HID_FLAGS   = 0x01;    // RemoteWake + NormallyConnectable
 
 uint16_t volumeColor(int volume) {
   (void)volume;
@@ -515,6 +766,8 @@ void refreshIdleDebugIfNeeded() {
 bool dialBackendReady() {
 #if !ARDUINO_USB_MODE
   return HID.ready();
+#elif defined(CONFIG_BLUEDROID_ENABLED)
+  return bleDialConnected && bleDialInputReport != nullptr;
 #else
   return false;
 #endif
@@ -523,7 +776,7 @@ bool dialBackendReady() {
 void printUsbHidStatus(const char* reason) {
 #if !ARDUINO_USB_MODE
   DIAL_SERIAL.printf(
-      ">HID_STATUS reason=%s usb_mode=%s cdc_on_boot=%d control_channel=%s hid_supported=1 usb_started=%d hid_ready=%d dial_backend=%s dial_backend_ready=%d product=%s\n",
+      ">HID_STATUS reason=%s usb_mode=%s cdc_on_boot=%d control_channel=%s hid_supported=1 usb_started=%d hid_ready=%d dial_backend=%s dial_backend_ready=%d backend_status=%s ble_connected=0 ble_advertising=0 product=%s note=%s last_backend_error=none last_send_type=none\n",
       reason,
       DIAL_USB_MODE_NAME,
       ARDUINO_USB_CDC_ON_BOOT,
@@ -532,16 +785,25 @@ void printUsbHidStatus(const char* reason) {
       dialBackendReady() ? 1 : 0,
       dialBackendName(),
       dialBackendReady() ? 1 : 0,
-      USB_PRODUCT_NAME);
+      dialBackendStatus(),
+      USB_PRODUCT_NAME,
+      dialBackendNote());
 #else
   DIAL_SERIAL.printf(
-      ">HID_STATUS reason=%s usb_mode=%s cdc_on_boot=%d control_channel=%s hid_supported=0 usb_started=0 hid_ready=0 dial_backend=%s dial_backend_ready=0 product=%s note=switch_to_USBMode_default_CDCOnBoot_cdc_for_custom_hid\n",
+      ">HID_STATUS reason=%s usb_mode=%s cdc_on_boot=%d control_channel=%s hid_supported=0 usb_started=0 hid_ready=0 dial_backend=%s dial_backend_ready=%d backend_status=%s ble_connected=%d ble_advertising=%d product=%s note=%s last_backend_error=%s last_send_type=%s\n",
       reason,
       DIAL_USB_MODE_NAME,
       ARDUINO_USB_CDC_ON_BOOT,
       DIAL_CONTROL_CHANNEL_NAME,
       dialBackendName(),
-      USB_PRODUCT_NAME);
+      dialBackendReady() ? 1 : 0,
+      dialBackendStatus(),
+      bleDialConnected ? 1 : 0,
+      bleDialAdvertisingActive ? 1 : 0,
+      USB_PRODUCT_NAME,
+      dialBackendNote(),
+      bleLastBackendError,
+      bleLastSendType);
 #endif
 }
 
@@ -603,6 +865,46 @@ void beginDialBackend() {
   HID.onEvent(onHidEvent);
   dialHid.begin();
   USB.begin();
+#elif defined(CONFIG_BLUEDROID_ENABLED)
+  bleDialBackendBegun = true;
+  setBleDialState(BleDialState::Initializing);
+  setBleLastBackendError("none");
+  logBleEvent("init");
+  BLEDevice::init(USB_PRODUCT_NAME);
+  bleDialServer = BLEDevice::createServer();
+  bleDialServer->setCallbacks(new DialBleServerCallbacks());
+  bleDialHid = new BLEHIDDevice(bleDialServer);
+  bleDialInputReport = bleDialHid->inputReport(DIAL_REPORT_ID);
+  bleDialHid->manufacturer();
+  bleDialHid->manufacturer(USB_MANUFACTURER_NAME);
+  bleDialHid->pnp(BLE_PNP_SIG, BLE_PNP_VID, BLE_PNP_PID, USB_FW_VERSION_BCD);
+  bleDialHid->hidInfo(BLE_HID_COUNTRY, BLE_HID_FLAGS);
+  uint16_t descLen = 0;
+  const uint8_t* desc = getDialReportDescriptor(descLen);
+  bleDialHid->reportMap(const_cast<uint8_t*>(desc), descLen);
+  bleDialHid->startServices();
+  bleDialHid->setBatteryLevel(100);
+  bleDialAdvertising = bleDialServer->getAdvertising();
+  BLEAdvertisementData bleAdvData;
+  BLEAdvertisementData bleScanRespData;
+  bleAdvData.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
+  bleAdvData.setAppearance(BLE_DIAL_APPEARANCE);
+  bleAdvData.setCompleteServices(bleDialHid->hidService()->getUUID());
+  bleScanRespData.setName(USB_PRODUCT_NAME);
+  bleDialAdvertising->setAdvertisementData(bleAdvData);
+  bleDialAdvertising->setScanResponseData(bleScanRespData);
+  bleDialAdvertising->setScanResponse(true);
+  bleDialAdvertising->setMinPreferred(0x06);
+  bleDialAdvertising->setMaxPreferred(0x12);
+  fillBleDialRandomAddress(bleDialRandomAddress);
+  bleDialAdvertising->setDeviceAddress(bleDialRandomAddress, BLE_ADDR_TYPE_RANDOM);
+  bleDialServer->startAdvertising();
+  bleDialAdvertisingActive = true;
+  setBleDialState(BleDialState::Advertising);
+  logBleEvent("advertising", "start");
+  printUsbHidStatus("ble_advertising_start");
+#else
+  bleDialBackendBegun = true;
 #endif
 }
 
@@ -612,9 +914,14 @@ bool dialBackendSendRotate(int direction) {
   bool ok1 = dialHid.sendReport(0, direction > 0 ? DIAL_ROTATE_RIGHT : DIAL_ROTATE_LEFT);
   bool ok2 = dialHid.sendReport(0, 0);
   return ok1 && ok2;
+#elif defined(CONFIG_BLUEDROID_ENABLED)
+  int8_t delta = direction > 0 ? DIAL_ROTATE_RIGHT : DIAL_ROTATE_LEFT;
+  setBleDialState(BleDialState::SendingRotate);
+  DIAL_SERIAL.printf(">BLE report rotate delta=%d\n", delta);
+  return bleDialSendReport(0, delta, direction > 0 ? "rotate_right" : "rotate_left");
 #else
   (void)direction;
-  return false;
+  return bleDialBackendBegun && dialBackendReady();
 #endif
 }
 
@@ -624,8 +931,12 @@ bool dialBackendSendPressPulse() {
   bool ok1 = dialHid.sendReport(DIAL_BUTTON_PRESS, 0);
   bool ok2 = dialHid.sendReport(0, 0);
   return ok1 && ok2;
+#elif defined(CONFIG_BLUEDROID_ENABLED)
+  setBleDialState(BleDialState::SendingPress);
+  logBleEvent("report", "press");
+  return bleDialSendReport(DIAL_BUTTON_PRESS, 0, "press");
 #else
-  return false;
+  return bleDialBackendBegun && dialBackendReady();
 #endif
 }
 
@@ -802,14 +1113,26 @@ void handleLine(const char* line) {
     return;
   }
   if (strcmp(line, "ENC STATUS") == 0) {
-    DIAL_SERIAL.printf(">ENC_STATUS mode=%s debug=%s volume=%d hid=%s\n",
+    DIAL_SERIAL.printf(">ENC_STATUS mode=%s debug=%s volume=%d hid=%s backend=%s backend_status=%s ble_connected=%d ble_advertising=%d last_send_type=%s\n",
                        currentModeText(),
                        uiDebugText,
                        currentVolume,
-                       dialBackendReady() ? "ready" : "wait");
-    drawVolumeUi(currentVolume, currentModeText(), true);
+                       dialBackendReady() ? "ready" : "wait",
+                       dialBackendName(),
+                       dialBackendStatus(),
+#if ARDUINO_USB_MODE && defined(CONFIG_BLUEDROID_ENABLED)
+                       bleDialConnected ? 1 : 0,
+                       bleDialAdvertisingActive ? 1 : 0,
+                       bleLastSendType
+#else
+                       0,
+                       0,
+                       "none"
+#endif
+                       );
     return;
   }
+
   if (strcmp(line, "HID STATUS") == 0 || strcmp(line, "USB STATUS") == 0) {
     printUsbHidStatus("serial_cmd");
   }
@@ -901,6 +1224,9 @@ void loop() {
   if (now - lastLoopProbeMs >= 3000) {
     lastLoopProbeMs = now;
     probeLog(wired ? "loop.wired" : "loop.wait_pc");
+  }
+  if (usbHidReadySeen && !dialBackendReady()) {
+    usbHidReadySeen = false;
   }
   if (!usbHidReadySeen && dialBackendReady()) {
     usbHidReadySeen = true;
