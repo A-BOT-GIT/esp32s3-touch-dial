@@ -160,6 +160,15 @@ def test_radial_report_send_2_byte_format():
     assert "buildRadialPayload" in ino, "Must have buildRadialPayload function"
     assert "sendRadialReport" in ino, "Must have sendRadialReport function"
     assert "radialButtonPressed" in ino, "Must track radial button state"
+    assert "RADIAL_DETENT_TENTHS_DEG" in ino, "Must define rotation scale constant"
+
+
+def test_rotation_delta_is_scaled():
+    ino = INO_PATH.read_text(encoding="utf-8")
+    assert "rawDelta * RADIAL_DETENT_TENTHS_DEG" in ino, \
+        "Rotation must use scaled delta (raw * RADIAL_DETENT_TENTHS_DEG)"
+    assert ">RADIAL dispatch raw=" in ino, "Must log raw delta"
+    assert "scaled=" in ino, "Must log scaled delta"
 
 
 def test_button_down_sends_01_00_on_raw_down():

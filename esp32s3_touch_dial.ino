@@ -104,7 +104,8 @@ constexpr unsigned long PRESS_DEBOUNCE_MS = 300;
 
 constexpr uint8_t DIAL_REPORT_ID = 1;  // Radial Controller requires non-zero Report ID
 constexpr uint8_t RADIAL_REPORT_ID = 1;
-constexpr int16_t RADIAL_DELTA_UNIT = 1;   // 0.1 degree per encoder step
+// Degrees per encoder detent in 0.1° units.  Trial: 60 = 6.0° per step.
+constexpr int16_t RADIAL_DETENT_TENTHS_DEG = 60;
 constexpr uint8_t DIAL_BUTTON_PRESS = 0x01;
 constexpr int8_t DIAL_ROTATE_RIGHT = 1;
 constexpr int8_t DIAL_ROTATE_LEFT = -1;
@@ -343,7 +344,8 @@ bool bleDialSendReport(uint8_t buttons, int8_t delta, const char* sendType) {
     radialButtonPressed = (buttons & DIAL_BUTTON_PRESS) != 0;
     sendRadialReport(radialButtonPressed, 0);
   } else {
-    sendRadialReport(radialButtonPressed, delta > 0 ? RADIAL_DELTA_UNIT : (delta < 0 ? -RADIAL_DELTA_UNIT : 0));
+    int16_t scaled = (delta > 0 ? RADIAL_DETENT_TENTHS_DEG : (delta < 0 ? -RADIAL_DETENT_TENTHS_DEG : 0));
+    sendRadialReport(radialButtonPressed, scaled);
   }
 
   restoreBleDialStableState();
@@ -1052,16 +1054,19 @@ void beginDialBackend() {
 bool dialBackendSendRotate(int direction) {
 #if !ARDUINO_USB_MODE
   if (!HID.ready()) return false;
-  bool ok1 = dialHid.sendReport(0, direction > 0 ? DIAL_ROTATE_RIGHT : DIAL_ROTATE_LEFT);
+  int8_t rawDelta = direction > 0 ? DIAL_ROTATE_RIGHT : DIAL_ROTATE_LEFT;
+  int16_t scaled = rawDelta * RADIAL_DETENT_TENTHS_DEG;
+  bool ok1 = dialHid.sendReport(0, scaled);
   bool ok2 = dialHid.sendReport(0, 0);
   return ok1 && ok2;
 #elif defined(CONFIG_BLUEDROID_ENABLED)
-  int8_t delta = direction > 0 ? DIAL_ROTATE_RIGHT : DIAL_ROTATE_LEFT;
-  DIAL_SERIAL.printf(">RADIAL dispatch button=%d delta=%d\n",
-                     radialButtonPressed ? 1 : 0, delta);
+  int8_t rawDelta = direction > 0 ? DIAL_ROTATE_RIGHT : DIAL_ROTATE_LEFT;
+  int16_t scaled = rawDelta * RADIAL_DETENT_TENTHS_DEG;
+  DIAL_SERIAL.printf(">RADIAL dispatch raw=%d scaled=%d button=%d\n",
+                     rawDelta, scaled, radialButtonPressed ? 1 : 0);
   setBleDialState(BleDialState::SendingRotate);
-  DIAL_SERIAL.printf(">BLE report rotate delta=%d\n", delta);
-  return bleDialSendReport(0, delta, direction > 0 ? "rotate_right" : "rotate_left");
+  DIAL_SERIAL.printf(">BLE report rotate delta=%d\n", scaled);
+  return bleDialSendReport(0, rawDelta, direction > 0 ? "rotate_right" : "rotate_left");
 #else
   (void)direction;
   return bleDialBackendBegun && dialBackendReady();

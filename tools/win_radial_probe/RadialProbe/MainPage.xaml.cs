@@ -12,6 +12,8 @@ namespace RadialProbe
     public sealed partial class MainPage : Page
     {
         private RadialController radialController;
+        private RadialControllerConfiguration radialConfig;
+        private RadialControllerMenuItem probeItem;
         private ObservableCollection<string> events = new ObservableCollection<string>();
         private double rotationTotal = 0;
         private int buttonClicks = 0;
@@ -41,23 +43,49 @@ namespace RadialProbe
             radialController = RadialController.CreateForCurrentView();
             radialController.RotationResolutionInDegrees = 1;
 
-            // Add menu item via radialController.Menu (not GetForCurrentView)
-            var probeItem = RadialControllerMenuItem.CreateFromFontGlyph(
-                "ESP32 Probe",
-                "",               // MDL2 glyph for ruler/measure
-                "Segoe MDL2 Assets");
-            radialController.Menu.Items.Add(probeItem);
+            radialConfig = RadialControllerConfiguration.GetForCurrentView();
 
-            // Configure radial controller settings
-            RadialControllerConfiguration.GetForCurrentView();
+            // Diagnostic mode: clear system defaults, keep only ESP32 Probe
+            radialConfig.SetDefaultMenuItems(
+                new RadialControllerSystemMenuItemKind[] { });
+
+            try
+            {
+                radialController.Menu.Items.Clear();
+                Log("Menu.Items.Clear OK");
+            }
+            catch (Exception ex)
+            {
+                Log("Menu.Items.Clear failed: " + ex.Message);
+            }
+
+            probeItem = RadialControllerMenuItem.CreateFromFontGlyph(
+                "ESP32 Probe",
+                "",
+                "Segoe MDL2 Assets");
+
+            probeItem.Invoked += OnProbeMenuInvoked;
+            radialController.Menu.Items.Add(probeItem);
 
             radialController.RotationChanged += OnRotationChanged;
             radialController.ButtonClicked += OnButtonClicked;
             radialController.ControlAcquired += OnControlAcquired;
             radialController.ControlLost += OnControlLost;
 
-            Log("RadialController initialized — ESP32 Probe menu item added");
-            StatusText.Text = "Ready — rotate/press ESP32";
+            // Optional events (compile-safe try)
+            try { radialController.ButtonPressed += OnButtonPressed; }
+            catch { Log("ButtonPressed not supported by SDK"); }
+            try { radialController.ButtonReleased += OnButtonReleased; }
+            catch { Log("ButtonReleased not supported by SDK"); }
+            try { radialController.ButtonHolding += OnButtonHolding; }
+            catch { Log("ButtonHolding not supported by SDK"); }
+
+            Log("RadialController diagnostic mode initialized");
+            Log("Default system menu items cleared");
+            Log("Custom menu item added: ESP32 Probe");
+
+            StatusText.Text = "Ready — long press, select ESP32 Probe";
+            MenuText.Text = "Menu: ESP32 Probe installed";
         }
 
         #region RadialController Events
@@ -101,6 +129,42 @@ namespace RadialProbe
             {
                 StatusText.Text = "Control lost";
                 Log("ControlLost");
+            });
+        }
+
+        private async void OnProbeMenuInvoked(RadialControllerMenuItem sender, object args)
+        {
+            await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+            {
+                MenuText.Text = "Menu: ESP32 Probe selected";
+                Log("MenuItem Invoked: ESP32 Probe");
+            });
+        }
+
+        private async void OnButtonPressed(RadialController sender,
+                                           RadialControllerButtonPressedEventArgs args)
+        {
+            await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+            {
+                Log("ButtonPressed");
+            });
+        }
+
+        private async void OnButtonReleased(RadialController sender,
+                                            RadialControllerButtonReleasedEventArgs args)
+        {
+            await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+            {
+                Log("ButtonReleased");
+            });
+        }
+
+        private async void OnButtonHolding(RadialController sender,
+                                           RadialControllerButtonHoldingEventArgs args)
+        {
+            await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+            {
+                Log("ButtonHolding");
             });
         }
 
