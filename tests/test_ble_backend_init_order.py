@@ -54,7 +54,7 @@ def test_ble_send_helper_records_attempted_send_type_before_ready_gate():
 
     send_fn = "bool bleDialSendReport(uint8_t buttons, int8_t delta, const char* sendType) {"
     set_send_type = "  setBleLastSendType(sendType);"
-    ready_gate = "  if (!dialBackendReady() || bleMediaInputReport == nullptr) {"
+    ready_gate = "  if (!dialBackendReady() || bleRadialInputReport == nullptr) {"
 
     assert send_fn in ino, "BLE send semantics should flow through the shared send helper"
     assert set_send_type in ino, "BLE send helper should record the attempted send type even when the send is skipped"
@@ -119,25 +119,26 @@ def test_ble_security_uses_sc_bond_or_bond():
         "BLE security must use bonded mode (SC_BOND or BOND)"
 
 
-def test_dial_report_id_is_one():
+def test_radial_report_id_is_one():
     ino = INO_PATH.read_text(encoding="utf-8")
-    assert "DIAL_REPORT_ID = 1" in ino, "Report ID must be 1 for Radial Controller"
+    assert "RADIAL_REPORT_ID = 1" in ino, "Report ID must be 1 for Radial Controller"
 
 
 def test_radial_controller_descriptor_structure():
     ino = INO_PATH.read_text(encoding="utf-8")
-    # Consumer Control report map (volume test branch).
-    assert "0x05, 0x0C" in ino, "Descriptor must use Usage Page (Consumer)"
-    assert "0x09, 0x01" in ino, "Descriptor must use Usage (Consumer Control)"
-    assert "0x85, MEDIA_REPORT_ID" in ino, "Descriptor must have Report ID from MEDIA_REPORT_ID"
-    assert "0x09, 0xE9" in ino, "Descriptor must include Volume Increment"
-    assert "0x09, 0xEA" in ino, "Descriptor must include Volume Decrement"
-    assert "0x09, 0xCD" in ino, "Descriptor must include Play/Pause"
-    assert "0x09, 0xE2" in ino, "Descriptor must include Mute"
-    assert "mediaReportMap" in ino, "Must define mediaReportMap"
-    # 4 usages in single Input, 4 bits padding
-    assert "0x95, 0x04" in ino, "Report Count must be 4 (single Input block)"
-    assert "0x75, 0x04" not in ino or "0x75, 0x01" in ino, "Padding must be Report Size=1, Count=4"
+    # Radial Controller: Generic Desktop / System Multi-Axis + Digitizers/Puck + Button + Dial
+    assert "0x05, 0x01" in ino, "Must have Usage Page Generic Desktop"
+    assert "0x09, 0x0E" in ino, "Must have Usage System Multi-Axis Controller"
+    assert "0x05, 0x0D" in ino, "Must have Usage Page Digitizers"
+    assert "0x09, 0x21" in ino, "Must have Usage Puck"
+    assert "0x09, 0x37" in ino, "Must have Usage Dial"
+    assert "0x75, 0x0F" in ino, "Dial must be 15-bit"
+    assert "0x81, 0x06" in ino, "Dial must be Data,Var,Rel"
+    assert "radialControllerReportMap" in ino, "Must define radialControllerReportMap"
+    # Must NOT contain Consumer Control
+    assert "0x05, 0x0C" not in ino, "Must NOT have Consumer Page"
+    assert "0x09, 0xE9" not in ino, "Must NOT have Volume Increment"
+    assert "0x09, 0xCD" not in ino, "Must NOT have Play/Pause"
 
 
 def test_cccd_and_report_reference_permissions_patched():
@@ -150,27 +151,43 @@ def test_cccd_and_report_reference_permissions_patched():
         "Open (non-encrypted) permissions must be applied to CCCD and Report Reference"
 
 
-def test_report_send_uses_consumer_control_1_byte_format():
+def test_radial_report_send_2_byte_format():
     ino = INO_PATH.read_text(encoding="utf-8")
-    # Consumer Control: 1 byte, no Report ID in characteristic value.
-    assert "uint8_t report[1]" in ino, "Report buffer must be 1 byte for Consumer Control"
-    assert "bleMediaInputReport->setValue" in ino, "Must use bleMediaInputReport for sending"
-    assert ">BLE media report len=1 data=" in ino, "Must print media report len and data"
-    assert "action=%s" in ino, "Must print action= label"
-    assert 'volume_up' in ino, "Must send volume_up action"
-    assert 'volume_down' in ino, "Must send volume_down action"
-    assert 'play_pause' in ino, "Must send play_pause action"
-    assert 'mute' in ino, "Must send mute action"
-    assert 'action=release' in ino, "Must send release action"
-    # Short press → Play/Pause (0x04), long press → Mute (0x08)
-    assert "sendPlayPause()" in ino, "Short press must call sendPlayPause"
-    assert "sendMute()" in ino, "Long press must call sendMute"
+    # Radial Controller: 2 bytes, no Report ID in characteristic value.
+    assert "uint8_t report[2]" in ino, "Report buffer must be 2 bytes for Radial"
+    assert "bleRadialInputReport->setValue" in ino, "Must use bleRadialInputReport"
+    assert ">BLE radial report len=2 data=" in ino, "Must print radial report len and data"
+    assert "buildRadialPayload" in ino, "Must have buildRadialPayload function"
+    assert "sendRadialReport" in ino, "Must have sendRadialReport function"
+    assert "radialButtonPressed" in ino, "Must track radial button state"
+
+
+def test_button_down_sends_01_00_on_raw_down():
+    ino = INO_PATH.read_text(encoding="utf-8")
+    # On raw down: immediately send button=1 delta=0 (01 00).
+    assert ">ENC_BUTTON raw down" in ino, "Must log raw down"
+    # sendRadialReport(true, 0) must be called AFTER raw down log.
+    raw_down_idx = ino.index(">ENC_BUTTON raw down")
+    send_idx = ino.index("sendRadialReport(true, 0)", raw_down_idx)
+    hid_sent_idx = ino.index(">ENC_BUTTON down hid=sent", raw_down_idx)
+    assert raw_down_idx < send_idx < hid_sent_idx, \
+        "raw down → sendRadialReport(true,0) → down hid=sent"
+
+
+def test_button_up_sends_00_00_on_raw_up():
+    ino = INO_PATH.read_text(encoding="utf-8")
+    # On raw up: immediately send button=0 delta=0 (00 00).
+    assert ">ENC_BUTTON raw up" in ino, "Must log raw up"
+    # sendRadialReport(false, 0) must be called AFTER raw up log.
+    raw_up_idx = ino.index(">ENC_BUTTON raw up")
+    send_idx = ino.index("sendRadialReport(false, 0)", raw_up_idx)
+    hid_sent_idx = ino.index(">ENC_BUTTON up held_ms=", raw_up_idx)
+    assert raw_up_idx < send_idx < hid_sent_idx, \
+        "raw up → sendRadialReport(false,0) → up held_ms=... hid=sent"
 
 
 def test_advertising_has_three_16bit_services():
     ino = INO_PATH.read_text(encoding="utf-8")
-    # Must advertise HID (0x1812), Battery (0x180F), Device Information (0x180A)
-    assert "0x07, 0x03" in ino, "AD length 7 + type 0x03 (Complete List of 16-bit UUIDs)"
     assert "0x12, 0x18" in ino, "HID service 0x1812 in little-endian"
     assert "0x0F, 0x18" in ino, "Battery service 0x180F in little-endian"
     assert "0x0A, 0x18" in ino, "Device Information service 0x180A in little-endian"

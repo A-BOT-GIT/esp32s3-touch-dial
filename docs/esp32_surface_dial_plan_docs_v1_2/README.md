@@ -1,6 +1,6 @@
 # ESP32-S3 Surface Dial / Windows Radial Controller 模拟项目计划文档集
 
-版本：v1.1  
+版本：v1.2  
 更新日期：2026-07-04  
 目标设备：ESP32-S3 + 旋钮编码器 + 按键  
 主目标：让 Windows 把 ESP32 识别并消费为 Surface Dial / Radial Controller 类设备，而不是普通媒体键旋钮。
@@ -34,6 +34,34 @@ hid_skip=0
 
 ---
 
+## v1.2 核心更新
+
+本版在 v1.1 的路线和决策基础上，增加了更具体的技术实现细节：
+
+```text
+1. ESP32 固件模块拆分建议
+2. BLE 初始化伪代码和调用顺序
+3. Radial Controller HID descriptor 字节级说明
+4. BLE HOGP characteristic / ReportRef / CCCD 结构
+5. 2-byte radial payload 的编码、边界、测试用例
+6. 编码器按键状态机：press / release / hold / rotate while pressed
+7. Windows Radial Probe 的 C# / UWP 实现骨架
+8. 串口日志与事件对照格式
+9. Agent 可执行的代码改造任务清单
+```
+
+新增重点文件：
+
+| 文件 | 用途 |
+|---|---|
+| `10_TECHNICAL_IMPLEMENTATION_DETAILS.md` | 固件实现细节总说明 |
+| `11_HID_DESCRIPTOR_AND_PAYLOAD_DETAILS.md` | HID descriptor 与 payload 字节级细节 |
+| `12_ENCODER_BUTTON_STATE_MACHINE.md` | 旋钮编码器和按钮状态机设计 |
+| `13_WINDOWS_RADIAL_PROBE_IMPLEMENTATION.md` | Windows Radial Probe 实现方案 |
+| `14_AGENT_IMPLEMENTATION_TASKS_DETAILED.md` | 更细的 agent 代码改造任务书 |
+
+---
+
 ## 文档结构
 
 | 文件 | 用途 |
@@ -47,7 +75,12 @@ hid_skip=0
 | `06_AGENT_TASKS.md` | 可以直接交给本地 Agent 执行的分阶段任务书 |
 | `07_ACCEPTANCE_CRITERIA.md` | 每个阶段的验收标准和不通过时的处理方式 |
 | `08_BRANCHING_AND_RELEASE_PLAN.md` | Git 分支、tag、提交、回退、发布策略 |
-| `09_CHANGELOG_V1_1.md` | 本次 v1.1 修改摘要 |
+| `09_CHANGELOG_V1_1.md` | v1.1 修改摘要 |
+| `10_TECHNICAL_IMPLEMENTATION_DETAILS.md` | 固件技术实现细节 |
+| `11_HID_DESCRIPTOR_AND_PAYLOAD_DETAILS.md` | HID descriptor 与 payload 字节细节 |
+| `12_ENCODER_BUTTON_STATE_MACHINE.md` | 编码器 / 按钮状态机 |
+| `13_WINDOWS_RADIAL_PROBE_IMPLEMENTATION.md` | Windows Radial Probe 实现方案 |
+| `14_AGENT_IMPLEMENTATION_TASKS_DETAILED.md` | 详细 agent 实施任务 |
 
 ---
 

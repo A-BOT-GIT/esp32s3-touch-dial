@@ -1,6 +1,6 @@
 # 01 后续总体路线图
 
-版本：v1.1
+版本：v1.2
 
 ## 总体策略
 
@@ -235,4 +235,68 @@ Phase 3：替换 Media Report 为 Radial Controller Report
 Phase 4：实现 2 字节 radial payload，不带 Report ID
 Phase 5：Windows Radial Probe 验证 RotationChanged / Button
 Phase 6：再做菜单、长按、haptic、on-screen
+```
+
+
+---
+
+# v1.2 技术实施顺序补充
+
+## 技术实施顺序
+
+正式进入 `feature/ble-radial-controller-mvp` 后，建议按这个顺序写代码：
+
+```text
+1. 固化 BLE 初始化策略
+   - SC_BOND + IO_NONE
+   - BLE_FORCE_ENCRYPTION_LEVEL=0
+   - 完整地址日志
+   - 1812/180F/180A advertising
+   - DIS 保留
+
+2. 清理 Consumer Control
+   - 删除 MEDIA_REPORT_ID
+   - 删除 mediaReportMap
+   - 删除 volume_up / volume_down / play_pause / mute 发送函数
+   - 删除 1-byte media report 逻辑
+
+3. 添加 Radial descriptor
+   - RADIAL_REPORT_ID=1
+   - System Multi-Axis Controller
+   - Puck physical collection
+   - Button 1 + Dial
+   - ReportRef=01 01
+
+4. 添加 radial payload 构造函数
+   - bit0 = button
+   - bit1-15 = signed 15-bit delta
+   - BLE value = 2 bytes
+   - 不带 Report ID
+
+5. 改编码器事件路径
+   - rotate -> sendRadialReport(buttonState, delta)
+   - button down -> sendRadialReport(true, 0)
+   - button up -> sendRadialReport(false, 0)
+   - long press 不发媒体键
+
+6. 添加测试
+   - descriptor byte sequence
+   - payload packing
+   - no Consumer Control
+   - no forced encryption
+   - ReportRef=01 01
+
+7. 实机测试
+   - 先只看连接稳定和 hid=sent
+   - 再看 Windows Radial Probe
+```
+
+详细实现请看：
+
+```text
+10_TECHNICAL_IMPLEMENTATION_DETAILS.md
+11_HID_DESCRIPTOR_AND_PAYLOAD_DETAILS.md
+12_ENCODER_BUTTON_STATE_MACHINE.md
+13_WINDOWS_RADIAL_PROBE_IMPLEMENTATION.md
+14_AGENT_IMPLEMENTATION_TASKS_DETAILED.md
 ```

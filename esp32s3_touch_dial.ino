@@ -103,7 +103,8 @@ constexpr unsigned long LONG_PRESS_MS = 850;
 constexpr unsigned long PRESS_DEBOUNCE_MS = 300;
 
 constexpr uint8_t DIAL_REPORT_ID = 1;  // Radial Controller requires non-zero Report ID
-constexpr uint8_t MEDIA_REPORT_ID = 2;  // Consumer Control volume test
+constexpr uint8_t RADIAL_REPORT_ID = 1;
+constexpr int16_t RADIAL_DELTA_UNIT = 1;   // 0.1 degree per encoder step
 constexpr uint8_t DIAL_BUTTON_PRESS = 0x01;
 constexpr int8_t DIAL_ROTATE_RIGHT = 1;
 constexpr int8_t DIAL_ROTATE_LEFT = -1;
@@ -123,70 +124,41 @@ enum class BleDialDescriptorProfile : uint8_t {
 // Default: Radial Controller minimal descriptor per task doc.
 constexpr BleDialDescriptorProfile BLE_DIAL_DESCRIPTOR_PROFILE = BleDialDescriptorProfile::Baseline;
 
-// Consumer Control report map: Volume+/-, Play/Pause, Mute.
-// Report ID 2, 4×1-bit buttons in a single Input + 4-bit padding = 1 byte.
-static const uint8_t mediaReportMap[] = {
-  0x05, 0x0C,              // Usage Page (Consumer)
-  0x09, 0x01,              // Usage (Consumer Control)
-  0xA1, 0x01,              // Collection (Application)
-  0x85, MEDIA_REPORT_ID,   //   Report ID (2)
-  0x09, 0xE9,              //   Usage (Volume Increment)
-  0x09, 0xEA,              //   Usage (Volume Decrement)
-  0x09, 0xCD,              //   Usage (Play/Pause)
-  0x09, 0xE2,              //   Usage (Mute)
-  0x15, 0x00,              //   Logical Minimum (0)
-  0x25, 0x01,              //   Logical Maximum (1)
-  0x75, 0x01,              //   Report Size (1)
-  0x95, 0x04,              //   Report Count (4)
-  0x81, 0x02,              //   Input (Data, Var, Abs)
-  0x75, 0x01,              //   Report Size (1)
-  0x95, 0x04,              //   Report Count (4)
-  0x81, 0x03,              //   Input (Const, Var, Abs) padding
-  0xC0                     // End Collection
-};
-
-// Minimal Radial Controller report map (kept for reference).
+// Radial Controller report map (v1.2 spec).
+// System Multi-Axis Controller + Digitizers/Puck + Button 1 + Dial (15-bit).
 static const uint8_t radialControllerReportMap[] = {
   0x05, 0x01,        // Usage Page (Generic Desktop)
   0x09, 0x0E,        // Usage (System Multi-Axis Controller)
   0xA1, 0x01,        // Collection (Application)
   0x85, 0x01,        //   Report ID (1)
-  0x05, 0x09,        //   Usage Page (Button)
-  0x09, 0x01,        //   Usage (Button 1)
-  0x95, 0x01,        //   Report Count (1)
-  0x75, 0x01,        //   Report Size (1)
-  0x15, 0x00,        //   Logical Min (0)
-  0x25, 0x01,        //   Logical Max (1)
-  0x81, 0x02,        //   Input (Data, Var, Abs)
-  0x05, 0x01,        //   Usage Page (Generic Desktop)
-  0x09, 0x37,        //   Usage (Dial)
-  0x95, 0x01,        //   Report Count (1)
-  0x75, 0x0F,        //   Report Size (15)
-  0x55, 0x0F,        //   Unit Exponent (-1)
-  0x65, 0x14,        //   Unit (Degrees, English Rotation)
-  0x36, 0xF0, 0xF1,  //   Physical Min (-3600)
-  0x46, 0x10, 0x0E,  //   Physical Max (3600)
-  0x16, 0xF0, 0xF1,  //   Logical Min (-3600)
-  0x26, 0x10, 0x0E,  //   Logical Max (3600)
-  0x81, 0x06,        //   Input (Data, Var, Rel)
-  0xC0               // End Collection
+  0x05, 0x0D,        //   Usage Page (Digitizers)
+  0x09, 0x21,        //   Usage (Puck)
+  0xA1, 0x00,        //   Collection (Physical)
+  0x05, 0x09,        //     Usage Page (Button)
+  0x09, 0x01,        //     Usage (Button 1)
+  0x95, 0x01,        //     Report Count (1)
+  0x75, 0x01,        //     Report Size (1)
+  0x15, 0x00,        //     Logical Min (0)
+  0x25, 0x01,        //     Logical Max (1)
+  0x81, 0x02,        //     Input (Data, Var, Abs)
+  0x05, 0x01,        //     Usage Page (Generic Desktop)
+  0x09, 0x37,        //     Usage (Dial)
+  0x95, 0x01,        //     Report Count (1)
+  0x75, 0x0F,        //     Report Size (15)
+  0x55, 0x0F,        //     Unit Exponent (-1)
+  0x65, 0x14,        //     Unit (Degrees, English Rotation)
+  0x36, 0xF0, 0xF1,  //     Physical Min (-3600)
+  0x46, 0x10, 0x0E,  //     Physical Max (3600)
+  0x16, 0xF0, 0xF1,  //     Logical Min (-3600)
+  0x26, 0x10, 0x0E,  //     Logical Max (3600)
+  0x81, 0x06,        //     Input (Data, Var, Rel)
+  0xC0,              //   End Collection (Physical)
+  0xC0               // End Collection (Application)
 };
 
-// Alias for descriptor selector.
-static const uint8_t dial_report_descriptor[] = {
-  // Stub — use radialControllerReportMap directly.
-};
-static const uint8_t dial_report_descriptor_variant_a[] = {
-  // Stub — placeholder.
-};
-
-// Returns the report descriptor for the currently selected profile.
 static const uint8_t* getDialReportDescriptor(uint16_t& outLen) {
-  (void)dial_report_descriptor;
-  (void)dial_report_descriptor_variant_a;
-  (void)radialControllerReportMap;
-  outLen = sizeof(mediaReportMap);
-  return mediaReportMap;
+  outLen = sizeof(radialControllerReportMap);
+  return radialControllerReportMap;
 }
 
 bool dialBackendReady();
@@ -207,7 +179,7 @@ BLEServer* bleDialServer = nullptr;
 BLEHIDDevice* bleDialHid = nullptr;
 BLEAdvertising* bleDialAdvertising = nullptr;
 BLECharacteristic* bleDialInputReport = nullptr;
-BLECharacteristic* bleMediaInputReport = nullptr;  // Consumer Control volume test
+BLECharacteristic* bleRadialInputReport = nullptr;
 esp_bd_addr_t bleDialRandomAddress = {0};
 bool bleDialConnected = false;
 bool bleDialAdvertisingActive = false;
@@ -218,6 +190,9 @@ unsigned long bleLastSendMs = 0;
 unsigned long bleLastRotateSendMs = 0;
 unsigned long bleLastPressSendMs = 0;
 #endif
+
+// Button state used by handleEncoder (outside BLE guard).
+bool radialButtonPressed = false;
 
 const char* dialBackendName() {
 #if !ARDUINO_USB_MODE
@@ -239,7 +214,7 @@ void fillBleDialRandomAddress(esp_bd_addr_t addr) {
   memcpy(addr, baseMac, 6);
   // TEST BRANCH: XOR byte 5 so Windows sees a different BLE address
   // and does not reuse cached GATT/HID state from the radial-controller build.
-  addr[5] ^= 0x24;
+  addr[5] ^= 0x31;
   // BLE random static address: top two bits of byte 0 must be 11.
   addr[0] = static_cast<uint8_t>(addr[0] | 0xC0);
 }
@@ -304,43 +279,34 @@ void restoreBleDialStableState() {
   }
 }
 
-// Consumer Control button mapping.
-// Volume Up=0x01, Volume Down=0x02, Play/Pause=0x04, Mute=0x08.
-static uint8_t mediaBitsForDelta(int8_t delta) {
-  if (delta > 0) return 0x01;  // Volume Increment
-  if (delta < 0) return 0x02;  // Volume Decrement
-  return 0x00;
+// --- Task E: Radial payload packing ---
+// bit0 = button, bit1-15 = signed 15-bit dial delta.
+uint16_t buildRadialPayload(bool pressed, int16_t deltaTenthsDegree) {
+  if (deltaTenthsDegree < -3600) deltaTenthsDegree = -3600;
+  if (deltaTenthsDegree >  3600) deltaTenthsDegree =  3600;
+  uint16_t dial15 = static_cast<uint16_t>(deltaTenthsDegree) & 0x7FFF;
+  return static_cast<uint16_t>((dial15 << 1) | (pressed ? 1 : 0));
 }
 
-static void sendMediaKey(uint8_t bits, const char* action) {
-  if (!bleDialConnected || !bleMediaInputReport) return;
-  uint8_t report[1] = {bits};
-  bleMediaInputReport->setValue(report, sizeof(report));
-  bleMediaInputReport->notify();
-  DIAL_SERIAL.printf(">BLE media report len=1 data=%02X action=%s hid=sent\n", bits, action);
-  delay(80);
-  uint8_t release[1] = {0x00};
-  bleMediaInputReport->setValue(release, sizeof(release));
-  bleMediaInputReport->notify();
-  DIAL_SERIAL.printf(">BLE media report len=1 data=00 action=release hid=sent\n");
-}
-
-static void sendVolumeUp()    { sendMediaKey(0x01, "volume_up"); }
-static void sendVolumeDown()  { sendMediaKey(0x02, "volume_down"); }
-static void sendPlayPause()   { sendMediaKey(0x04, "play_pause"); }
-static void sendMute()        { sendMediaKey(0x08, "mute"); }
-
-bool bleDialSendReleaseReport() {
-  if (bleMediaInputReport == nullptr) {
-    setBleLastBackendError("report_missing");
-    restoreBleDialStableState();
+// --- Task F: Radial report sender ---
+// 2-byte BLE notify value, NO Report ID in payload.
+bool sendRadialReport(bool pressed, int16_t delta) {
+  if (!bleDialConnected || !bleRadialInputReport) {
+    DIAL_SERIAL.printf(">BLE radial report skip button=%d delta=%d connected=%d report=%d\n",
+                       pressed ? 1 : 0, delta,
+                       bleDialConnected ? 1 : 0,
+                       bleRadialInputReport ? 1 : 0);
     return false;
   }
-  delay(80);
-  uint8_t releaseReport[1] = {0x00};
-  bleMediaInputReport->setValue(releaseReport, sizeof(releaseReport));
-  bleMediaInputReport->notify();
-  DIAL_SERIAL.printf(">BLE media report len=1 data=00 action=release hid=sent\n");
+  uint16_t payload = buildRadialPayload(pressed, delta);
+  uint8_t report[2] = {
+    static_cast<uint8_t>(payload & 0xFF),
+    static_cast<uint8_t>((payload >> 8) & 0xFF)
+  };
+  bleRadialInputReport->setValue(report, sizeof(report));
+  bleRadialInputReport->notify();
+  DIAL_SERIAL.printf(">BLE radial report len=2 data=%02X %02X button=%d delta=%d hid=sent\n",
+                     report[0], report[1], pressed ? 1 : 0, delta);
   return true;
 }
 
@@ -350,10 +316,10 @@ bool bleDialIsPressSendType(const char* sendType) {
 
 bool bleDialSendReport(uint8_t buttons, int8_t delta, const char* sendType) {
   setBleLastSendType(sendType);
-  if (!dialBackendReady() || bleMediaInputReport == nullptr) {
-    const char* skipReason = bleMediaInputReport == nullptr ? "report_missing" : "not_ready";
+  if (!dialBackendReady() || bleRadialInputReport == nullptr) {
+    const char* skipReason = bleRadialInputReport == nullptr ? "report_missing" : "not_ready";
     setBleLastBackendError(skipReason);
-    logBleEvent("report", bleMediaInputReport == nullptr ? "skip reason=report_missing" : "skip reason=not_ready");
+    logBleEvent("report", bleRadialInputReport == nullptr ? "skip reason=report_missing" : "skip reason=not_ready");
     restoreBleDialStableState();
     return false;
   }
@@ -374,10 +340,10 @@ bool bleDialSendReport(uint8_t buttons, int8_t delta, const char* sendType) {
   setBleLastBackendError("none");
 
   if (isPress) {
-    sendPlayPause();
+    radialButtonPressed = (buttons & DIAL_BUTTON_PRESS) != 0;
+    sendRadialReport(radialButtonPressed, 0);
   } else {
-    if (delta > 0) sendVolumeUp();
-    else if (delta < 0) sendVolumeDown();
+    sendRadialReport(radialButtonPressed, delta > 0 ? RADIAL_DELTA_UNIT : (delta < 0 ? -RADIAL_DELTA_UNIT : 0));
   }
 
   restoreBleDialStableState();
@@ -385,15 +351,6 @@ bool bleDialSendReport(uint8_t buttons, int8_t delta, const char* sendType) {
 }
 #endif
 
-// Media key stubs for USB builds (ARDUINO_USB_MODE=0).
-// Real implementations inside the BLE block (ARDUINO_USB_MODE=1) override these.
-#if !ARDUINO_USB_MODE
-static void sendMediaKey(uint8_t, const char*) {}
-static void sendVolumeUp()    {}
-static void sendVolumeDown()  {}
-static void sendPlayPause()   {}
-static void sendMute()        {}
-#endif
 
 const char* dialBackendStatus() {
 #if !ARDUINO_USB_MODE
@@ -544,8 +501,8 @@ bool sEncSwitchWasLow = false;
 unsigned long encSwitchDownMs = 0;
 bool encLongPressSent = false;
 
-// EXPERIMENT: no forced encryption. Name changed to avoid Windows cache.
-constexpr char USB_PRODUCT_NAME[] = "ESP32-S3 Media Dial NE";
+// Radial Controller MVP. Name + address XOR avoid Windows cache.
+constexpr char USB_PRODUCT_NAME[] = "ESP32-S3 Radial MVP";
 
 // Set to 1 to force encryption on connect (may cause disconnect storm).
 #define BLE_FORCE_ENCRYPTION_LEVEL 0
@@ -865,7 +822,7 @@ bool dialBackendReady() {
 #if !ARDUINO_USB_MODE
   return HID.ready();
 #elif defined(CONFIG_BLUEDROID_ENABLED)
-  return bleDialConnected && bleMediaInputReport != nullptr;
+  return bleDialConnected && bleRadialInputReport != nullptr;
 #else
   return false;
 #endif
@@ -1004,7 +961,7 @@ void beginDialBackend() {
   }
 
   // --- HID device setup ---
-  DIAL_SERIAL.printf("[BLE-HID] media report id: %u\n", MEDIA_REPORT_ID);
+  DIAL_SERIAL.printf("[BLE-HID] radial report id: %u\n", RADIAL_REPORT_ID);
   bleDialServer = BLEDevice::createServer();
   bleDialServer->setCallbacks(new DialBleServerCallbacks());
   bleDialHid = new BLEHIDDevice(bleDialServer);
@@ -1014,32 +971,28 @@ void beginDialBackend() {
   bleDialHid->reportMap(const_cast<uint8_t*>(desc), descLen);
   DIAL_SERIAL.printf("[BLE-HID] report map size: %u\n", descLen);
 
-  // Consumer Control volume test: use MEDIA_REPORT_ID.
-  bleMediaInputReport = bleDialHid->inputReport(MEDIA_REPORT_ID);
-  DIAL_SERIAL.println("[BLE-HID] media input report created");
+  // --- Task D: Radial input report ---
+  bleRadialInputReport = bleDialHid->inputReport(RADIAL_REPORT_ID);
+  DIAL_SERIAL.println("[BLE-HID] radial input report created");
 
-  // --- Task E: patch descriptor permissions on media report ---
+  // --- Task E: patch descriptor permissions ---
   {
-    BLEDescriptor* rptRef = bleMediaInputReport->getDescriptorByUUID(BLEUUID((uint16_t)0x2908));
-    BLEDescriptor* cccd   = bleMediaInputReport->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
-    if (rptRef) rptRef->setAccessPermissions(ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE);
+    BLEDescriptor* rptRef = bleRadialInputReport->getDescriptorByUUID(BLEUUID((uint16_t)0x2908));
+    BLEDescriptor* cccd   = bleRadialInputReport->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+    if (rptRef) rptRef->setAccessPermissions(ESP_GATT_PERM_READ);  // ReportRef: read-only
     if (cccd)   cccd->setAccessPermissions(ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE);
-    DIAL_SERIAL.printf("[BLE-HID] media descriptor permissions patched: 2908=%s, 2902=%s\n",
+    DIAL_SERIAL.printf("[BLE-HID] descriptor permissions patched: 2908=%s, 2902=%s\n",
                        rptRef ? "yes" : "no", cccd ? "yes" : "no");
     if (rptRef) {
-      // Report Reference value is set by the library: {reportID, 0x01}.
-      // Should be {0x02, 0x01} for MEDIA_REPORT_ID=2.
       uint8_t* refVal = rptRef->getValue();
       size_t refLen = rptRef->getLength();
       if (refVal && refLen >= 2) {
-        DIAL_SERIAL.printf("[BLE-HID] media report ref: %02X %02X\n", refVal[0], refVal[1]);
+        DIAL_SERIAL.printf("[BLE-HID] radial report ref: %02X %02X\n", refVal[0], refVal[1]);
       } else {
-        DIAL_SERIAL.printf("[BLE-HID] media report ref: missing or too short (len=%u)\n", refLen);
+        DIAL_SERIAL.printf("[BLE-HID] radial report ref: missing or too short (len=%u)\n", refLen);
       }
     }
   }
-
-  // TEST BRANCH: only MEDIA_REPORT_ID=2. No DIAL_REPORT_ID=1 secondary report.
 
   // --- Task F: Device Information Service ---
   bleDialHid->manufacturer();
@@ -1104,6 +1057,8 @@ bool dialBackendSendRotate(int direction) {
   return ok1 && ok2;
 #elif defined(CONFIG_BLUEDROID_ENABLED)
   int8_t delta = direction > 0 ? DIAL_ROTATE_RIGHT : DIAL_ROTATE_LEFT;
+  DIAL_SERIAL.printf(">RADIAL dispatch button=%d delta=%d\n",
+                     radialButtonPressed ? 1 : 0, delta);
   setBleDialState(BleDialState::SendingRotate);
   DIAL_SERIAL.printf(">BLE report rotate delta=%d\n", delta);
   return bleDialSendReport(0, delta, direction > 0 ? "rotate_right" : "rotate_left");
@@ -1184,8 +1139,7 @@ void emitLegacyTouchAbsoluteVolume(int volume, uint16_t x, uint16_t y) {
 void emitLegacyTouchLongPress() {
   setModeText("MUTE");
   setDebugText("TOUCH", "HOLD", true);
-  DIAL_SERIAL.println(">MUTE_TOGGLE");
-  sendMute();
+  DIAL_SERIAL.println(">ENC_BUTTON hold candidate for radial menu");
   drawVolumeUi(currentVolume, currentModeText(), true);
 }
 
@@ -1210,21 +1164,33 @@ void handleEncoder() {
   interrupts();
 
   if (direction != 0) {
+    DIAL_SERIAL.printf(">ENC raw delta=%d\n", direction);
     dispatchRotateEvent(direction, "ENC");
   }
 
   bool swLow = digitalRead(PIN_ENC_SW) == LOW;
   if (swLow && !sEncSwitchWasLow) {
+    DIAL_SERIAL.println(">ENC_BUTTON raw down");
     encSwitchDownMs = millis();
     encLongPressSent = false;
+    radialButtonPressed = true;
+#if ARDUINO_USB_MODE
+    sendRadialReport(true, 0);
+    DIAL_SERIAL.println(">ENC_BUTTON down hid=sent");
+#endif
   }
   if (swLow && !encLongPressSent && millis() - encSwitchDownMs >= LONG_PRESS_MS) {
     encLongPressSent = true;
-    sendMute();
+    DIAL_SERIAL.println(">ENC_BUTTON hold candidate for radial menu");
   }
-  if (!swLow && sEncSwitchWasLow && !encLongPressSent) {
-    // Short press: released before LONG_PRESS_MS.
-    dispatchPressPulseEvent("ENC");
+  if (!swLow && sEncSwitchWasLow) {
+    DIAL_SERIAL.println(">ENC_BUTTON raw up");
+    unsigned long heldMs = millis() - encSwitchDownMs;
+    radialButtonPressed = false;
+#if ARDUINO_USB_MODE
+    sendRadialReport(false, 0);
+    DIAL_SERIAL.printf(">ENC_BUTTON up held_ms=%lu hid=sent\n", heldMs);
+#endif
   }
   sEncSwitchWasLow = swLow;
 }

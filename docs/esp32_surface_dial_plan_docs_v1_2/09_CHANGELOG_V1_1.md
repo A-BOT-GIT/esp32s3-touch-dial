@@ -163,3 +163,36 @@ Radial MVP 仍然必须使用:
 4. 将 Media Dial 替换为 Radial Controller MVP
 5. 用 Windows Radial Probe 验证
 ```
+
+
+---
+
+# v1.2 技术细节补充
+
+本次在 v1.1 基础上新增技术实现文件：
+
+```text
+10_TECHNICAL_IMPLEMENTATION_DETAILS.md
+11_HID_DESCRIPTOR_AND_PAYLOAD_DETAILS.md
+12_ENCODER_BUTTON_STATE_MACHINE.md
+13_WINDOWS_RADIAL_PROBE_IMPLEMENTATION.md
+14_AGENT_IMPLEMENTATION_TASKS_DETAILED.md
+```
+
+新增内容包括：
+
+```text
+- BLE 初始化顺序
+- no-force-encryption 代码开关
+- stable BLE address 实现
+- advertising service AD 字节
+- HOGP service 结构
+- ReportRef / CCCD patch 伪代码
+- Radial descriptor 字节级解释
+- 2-byte payload packing 公式
+- delta signed 15-bit 示例
+- 按键状态机
+- 长按处理原则
+- Windows Radial Probe C# 骨架
+- Agent 代码级任务拆分
+```

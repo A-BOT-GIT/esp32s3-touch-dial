@@ -1,6 +1,6 @@
 # 02 ESP32 固件侧 Radial Controller MVP 详细实现规范
 
-版本：v1.1
+版本：v1.2
 
 ## 1. 文件范围
 
@@ -461,4 +461,27 @@ pytest -q
 
 ```text
 >BLE radial report len=2 data=00 00 button=0 delta=0 hid=sent
+```
+
+
+---
+
+# v1.2 技术细节补充索引
+
+本文件保留核心规范。更细的实现细节拆到以下文件：
+
+```text
+10_TECHNICAL_IMPLEMENTATION_DETAILS.md
+11_HID_DESCRIPTOR_AND_PAYLOAD_DETAILS.md
+12_ENCODER_BUTTON_STATE_MACHINE.md
+```
+
+Agent 实施时应同时阅读上述文件，尤其是：
+
+```text
+- BLE 初始化调用顺序
+- ReportRef / CCCD patch 时机
+- Radial 2-byte payload 构造
+- 按键按下/释放状态机
+- long press 不再映射为 Consumer Mute
 ```
