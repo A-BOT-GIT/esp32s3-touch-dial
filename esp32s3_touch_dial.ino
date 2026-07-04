@@ -26,6 +26,7 @@
 #include "BLEAdvertising.h"
 #include "BLEDevice.h"
 #include "BLEHIDDevice.h"
+#include "BLESecurity.h"
 #include "BLEServer.h"
 #include <esp_random.h>
 #endif
@@ -101,50 +102,91 @@ constexpr unsigned long TAP_MAX_MS = 550;
 constexpr unsigned long LONG_PRESS_MS = 850;
 constexpr unsigned long PRESS_DEBOUNCE_MS = 300;
 
-constexpr uint8_t DIAL_REPORT_ID = 10;
+constexpr uint8_t DIAL_REPORT_ID = 1;  // Radial Controller requires non-zero Report ID
+constexpr uint8_t MEDIA_REPORT_ID = 2;  // Consumer Control volume test
 constexpr uint8_t DIAL_BUTTON_PRESS = 0x01;
 constexpr int8_t DIAL_ROTATE_RIGHT = 1;
 constexpr int8_t DIAL_ROTATE_LEFT = -1;
 
 // BLE HID identity — extracted constants for minimal tuning rounds.
 // Do not change behavior unless the descriptor profile selector is switched.
-// Round 1 appearance tuning: use HID_JOYSTICK (0x03C3, ESP_BLE_APPEARANCE_HID_JOYSTICK)
-// instead of GENERIC_HID (0x03C0). A dial is a single-axis relative controller
-// closest to a joystick among the BLE HID subtypes defined in BLEHIDDevice.h.
-// If this makes Windows behavior worse, revert to 0x03C0 before the next round.
-constexpr uint16_t BLE_DIAL_APPEARANCE = 0x03C3;  // HID_JOYSTICK
+// Round 1 result: HID_JOYSTICK (0x03C3) did not improve connection stability.
+// Reverted to GENERIC_HID (0x03C0) baseline. Proceeding to Round 2 descriptor tuning.
+constexpr uint16_t BLE_DIAL_APPEARANCE = 0x03C0;  // GENERIC_HID
 
-static const uint8_t dial_report_descriptor[] = {
+// BLE HID descriptor profile switch — change here to test identity variant.
+enum class BleDialDescriptorProfile : uint8_t {
+  Baseline = 0,   // Minimal Radial Controller (System Multi-Axis + Dial + Button)
+  VariantA = 1,   // placeholder
+  VariantB = 2,   // placeholder
+};
+// Default: Radial Controller minimal descriptor per task doc.
+constexpr BleDialDescriptorProfile BLE_DIAL_DESCRIPTOR_PROFILE = BleDialDescriptorProfile::Baseline;
+
+// Consumer Control report map: Volume+/-, Play/Pause, Mute.
+// Report ID 2, 4×1-bit buttons in a single Input + 4-bit padding = 1 byte.
+static const uint8_t mediaReportMap[] = {
+  0x05, 0x0C,              // Usage Page (Consumer)
+  0x09, 0x01,              // Usage (Consumer Control)
+  0xA1, 0x01,              // Collection (Application)
+  0x85, MEDIA_REPORT_ID,   //   Report ID (2)
+  0x09, 0xE9,              //   Usage (Volume Increment)
+  0x09, 0xEA,              //   Usage (Volume Decrement)
+  0x09, 0xCD,              //   Usage (Play/Pause)
+  0x09, 0xE2,              //   Usage (Mute)
+  0x15, 0x00,              //   Logical Minimum (0)
+  0x25, 0x01,              //   Logical Maximum (1)
+  0x75, 0x01,              //   Report Size (1)
+  0x95, 0x04,              //   Report Count (4)
+  0x81, 0x02,              //   Input (Data, Var, Abs)
+  0x75, 0x01,              //   Report Size (1)
+  0x95, 0x04,              //   Report Count (4)
+  0x81, 0x03,              //   Input (Const, Var, Abs) padding
+  0xC0                     // End Collection
+};
+
+// Minimal Radial Controller report map (kept for reference).
+static const uint8_t radialControllerReportMap[] = {
   0x05, 0x01,        // Usage Page (Generic Desktop)
   0x09, 0x0E,        // Usage (System Multi-Axis Controller)
   0xA1, 0x01,        // Collection (Application)
-  0x85, DIAL_REPORT_ID,
+  0x85, 0x01,        //   Report ID (1)
   0x05, 0x09,        //   Usage Page (Button)
-  0x19, 0x01,
-  0x29, 0x01,
-  0x15, 0x00,
-  0x25, 0x01,
-  0x95, 0x01,
-  0x75, 0x01,
-  0x81, 0x02,        //   Input (Data,Var,Abs)
-  0x95, 0x07,
-  0x75, 0x01,
-  0x81, 0x03,        //   Input (Const,Var,Abs) padding
+  0x09, 0x01,        //   Usage (Button 1)
+  0x95, 0x01,        //   Report Count (1)
+  0x75, 0x01,        //   Report Size (1)
+  0x15, 0x00,        //   Logical Min (0)
+  0x25, 0x01,        //   Logical Max (1)
+  0x81, 0x02,        //   Input (Data, Var, Abs)
   0x05, 0x01,        //   Usage Page (Generic Desktop)
   0x09, 0x37,        //   Usage (Dial)
-  0x15, 0x81,        //   Logical Min (-127)
-  0x25, 0x7F,        //   Logical Max (127)
-  0x75, 0x08,
-  0x95, 0x01,
-  0x81, 0x06,        //   Input (Data,Var,Rel)
+  0x95, 0x01,        //   Report Count (1)
+  0x75, 0x0F,        //   Report Size (15)
+  0x55, 0x0F,        //   Unit Exponent (-1)
+  0x65, 0x14,        //   Unit (Degrees, English Rotation)
+  0x36, 0xF0, 0xF1,  //   Physical Min (-3600)
+  0x46, 0x10, 0x0E,  //   Physical Max (3600)
+  0x16, 0xF0, 0xF1,  //   Logical Min (-3600)
+  0x26, 0x10, 0x0E,  //   Logical Max (3600)
+  0x81, 0x06,        //   Input (Data, Var, Rel)
   0xC0               // End Collection
 };
 
+// Alias for descriptor selector.
+static const uint8_t dial_report_descriptor[] = {
+  // Stub — use radialControllerReportMap directly.
+};
+static const uint8_t dial_report_descriptor_variant_a[] = {
+  // Stub — placeholder.
+};
+
 // Returns the report descriptor for the currently selected profile.
-// Currently only Baseline is implemented; VariantA/VariantB are stubs for future rounds.
 static const uint8_t* getDialReportDescriptor(uint16_t& outLen) {
-  outLen = sizeof(dial_report_descriptor);
-  return dial_report_descriptor;
+  (void)dial_report_descriptor;
+  (void)dial_report_descriptor_variant_a;
+  (void)radialControllerReportMap;
+  outLen = sizeof(mediaReportMap);
+  return mediaReportMap;
 }
 
 bool dialBackendReady();
@@ -165,6 +207,7 @@ BLEServer* bleDialServer = nullptr;
 BLEHIDDevice* bleDialHid = nullptr;
 BLEAdvertising* bleDialAdvertising = nullptr;
 BLECharacteristic* bleDialInputReport = nullptr;
+BLECharacteristic* bleMediaInputReport = nullptr;  // Consumer Control volume test
 esp_bd_addr_t bleDialRandomAddress = {0};
 bool bleDialConnected = false;
 bool bleDialAdvertisingActive = false;
@@ -186,14 +229,19 @@ const char* dialBackendName() {
 
 #if ARDUINO_USB_MODE && defined(CONFIG_BLUEDROID_ENABLED)
 void fillBleDialRandomAddress(esp_bd_addr_t addr) {
-  uint32_t r0 = esp_random();
-  uint32_t r1 = esp_random();
-  addr[0] = static_cast<uint8_t>((r0 & 0x3F) | 0xC0);
-  addr[1] = static_cast<uint8_t>((r0 >> 8) & 0xFF);
-  addr[2] = static_cast<uint8_t>((r0 >> 16) & 0xFF);
-  addr[3] = static_cast<uint8_t>((r0 >> 24) & 0xFF);
-  addr[4] = static_cast<uint8_t>(r1 & 0xFF);
-  addr[5] = static_cast<uint8_t>((r1 >> 8) & 0xFF);
+  // Derive stable random static address from BT base MAC.
+  // Fall back to WiFi STA MAC if BT MAC unavailable.
+  uint8_t baseMac[6] = {0};
+  esp_err_t err = esp_read_mac(baseMac, ESP_MAC_BT);
+  if (err != ESP_OK) {
+    esp_read_mac(baseMac, ESP_MAC_WIFI_STA);
+  }
+  memcpy(addr, baseMac, 6);
+  // TEST BRANCH: XOR byte 5 so Windows sees a different BLE address
+  // and does not reuse cached GATT/HID state from the radial-controller build.
+  addr[5] ^= 0x24;
+  // BLE random static address: top two bits of byte 0 must be 11.
+  addr[0] = static_cast<uint8_t>(addr[0] | 0xC0);
 }
 
 const char* bleDialStateName() {
@@ -256,16 +304,43 @@ void restoreBleDialStableState() {
   }
 }
 
+// Consumer Control button mapping.
+// Volume Up=0x01, Volume Down=0x02, Play/Pause=0x04, Mute=0x08.
+static uint8_t mediaBitsForDelta(int8_t delta) {
+  if (delta > 0) return 0x01;  // Volume Increment
+  if (delta < 0) return 0x02;  // Volume Decrement
+  return 0x00;
+}
+
+static void sendMediaKey(uint8_t bits, const char* action) {
+  if (!bleDialConnected || !bleMediaInputReport) return;
+  uint8_t report[1] = {bits};
+  bleMediaInputReport->setValue(report, sizeof(report));
+  bleMediaInputReport->notify();
+  DIAL_SERIAL.printf(">BLE media report len=1 data=%02X action=%s hid=sent\n", bits, action);
+  delay(80);
+  uint8_t release[1] = {0x00};
+  bleMediaInputReport->setValue(release, sizeof(release));
+  bleMediaInputReport->notify();
+  DIAL_SERIAL.printf(">BLE media report len=1 data=00 action=release hid=sent\n");
+}
+
+static void sendVolumeUp()    { sendMediaKey(0x01, "volume_up"); }
+static void sendVolumeDown()  { sendMediaKey(0x02, "volume_down"); }
+static void sendPlayPause()   { sendMediaKey(0x04, "play_pause"); }
+static void sendMute()        { sendMediaKey(0x08, "mute"); }
+
 bool bleDialSendReleaseReport() {
-  if (bleDialInputReport == nullptr) {
+  if (bleMediaInputReport == nullptr) {
     setBleLastBackendError("report_missing");
     restoreBleDialStableState();
     return false;
   }
-
-  uint8_t releaseReport[2] = {0, 0};
-  bleDialInputReport->setValue(releaseReport, sizeof(releaseReport));
-  bleDialInputReport->notify();
+  delay(80);
+  uint8_t releaseReport[1] = {0x00};
+  bleMediaInputReport->setValue(releaseReport, sizeof(releaseReport));
+  bleMediaInputReport->notify();
+  DIAL_SERIAL.printf(">BLE media report len=1 data=00 action=release hid=sent\n");
   return true;
 }
 
@@ -275,10 +350,10 @@ bool bleDialIsPressSendType(const char* sendType) {
 
 bool bleDialSendReport(uint8_t buttons, int8_t delta, const char* sendType) {
   setBleLastSendType(sendType);
-  if (!dialBackendReady() || bleDialInputReport == nullptr) {
-    const char* skipReason = bleDialInputReport == nullptr ? "report_missing" : "not_ready";
+  if (!dialBackendReady() || bleMediaInputReport == nullptr) {
+    const char* skipReason = bleMediaInputReport == nullptr ? "report_missing" : "not_ready";
     setBleLastBackendError(skipReason);
-    logBleEvent("report", bleDialInputReport == nullptr ? "skip reason=report_missing" : "skip reason=not_ready");
+    logBleEvent("report", bleMediaInputReport == nullptr ? "skip reason=report_missing" : "skip reason=not_ready");
     restoreBleDialStableState();
     return false;
   }
@@ -297,13 +372,27 @@ bool bleDialSendReport(uint8_t buttons, int8_t delta, const char* sendType) {
 
   *lastSendSlot = now;
   setBleLastBackendError("none");
-  uint8_t report[2] = {buttons, static_cast<uint8_t>(delta)};
-  bleDialInputReport->setValue(report, sizeof(report));
-  bleDialInputReport->notify();
-  bool released = bleDialSendReleaseReport();
+
+  if (isPress) {
+    sendPlayPause();
+  } else {
+    if (delta > 0) sendVolumeUp();
+    else if (delta < 0) sendVolumeDown();
+  }
+
   restoreBleDialStableState();
-  return released;
+  return true;
 }
+#endif
+
+// Media key stubs for USB builds (ARDUINO_USB_MODE=0).
+// Real implementations inside the BLE block (ARDUINO_USB_MODE=1) override these.
+#if !ARDUINO_USB_MODE
+static void sendMediaKey(uint8_t, const char*) {}
+static void sendVolumeUp()    {}
+static void sendVolumeDown()  {}
+static void sendPlayPause()   {}
+static void sendMute()        {}
 #endif
 
 const char* dialBackendStatus() {
@@ -355,7 +444,16 @@ class DialHIDDevice : public USBHIDDevice {
   }
 
   bool sendReport(uint8_t buttons, int8_t delta) {
-    uint8_t report[2] = {buttons, static_cast<uint8_t>(delta)};
+    uint8_t report[3];
+    report[0] = DIAL_REPORT_ID;
+    bool pressed = (buttons & DIAL_BUTTON_PRESS) != 0;
+    int16_t dial15 = static_cast<int16_t>(delta) * 10;
+    if (dial15 < -3600) dial15 = -3600;
+    if (dial15 >  3600) dial15 =  3600;
+    uint16_t dialBits = static_cast<uint16_t>(dial15) & 0x7FFF;
+    uint16_t payload = static_cast<uint16_t>((dialBits << 1) | (pressed ? 1 : 0));
+    report[1] = static_cast<uint8_t>(payload & 0xFF);
+    report[2] = static_cast<uint8_t>((payload >> 8) & 0xFF);
     return HID.SendReport(DIAL_REPORT_ID, report, sizeof(report));
   }
 };
@@ -375,11 +473,13 @@ class DialBleServerCallbacks : public BLEServerCallbacks {
     setBleDialState(BleDialState::ConnectedIdle);
     usbHidReadySeen = false;
     logBleEvent("connected");
+    DIAL_SERIAL.println("[BLE-HID] connected");
     printUsbHidStatus("ble_connect");
   }
 
   void onDisconnect(BLEServer* pServer) override {
     bleDialConnected = false;
+    DIAL_SERIAL.println("[BLE-HID] disconnected");
     usbHidReadySeen = false;
     resetBleDialSendTracking();
     setBleDialState(BleDialState::RestartingAdvertising);
@@ -441,18 +541,16 @@ static const int8_t ENC_TABLE[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1
 volatile int sEncDir = 0;
 volatile int8_t sEncState = 0;
 bool sEncSwitchWasLow = false;
+unsigned long encSwitchDownMs = 0;
+bool encLongPressSent = false;
 
-constexpr char USB_PRODUCT_NAME[] = "ESP32-S3 Touch Dial";
+// EXPERIMENT: no forced encryption. Name changed to avoid Windows cache.
+constexpr char USB_PRODUCT_NAME[] = "ESP32-S3 Media Dial NE";
+
+// Set to 1 to force encryption on connect (may cause disconnect storm).
+#define BLE_FORCE_ENCRYPTION_LEVEL 0
 constexpr char USB_MANUFACTURER_NAME[] = "zza";
 constexpr uint16_t USB_FW_VERSION_BCD = 0x0100;
-
-// BLE HID descriptor profile switch — change here to test identity variant.
-enum class BleDialDescriptorProfile : uint8_t {
-  Baseline = 0,   // current: System Multi-Axis Controller + Dial
-  VariantA = 1,   // future: more conservative HID shape
-  VariantB = 2,   // future: another variant
-};
-constexpr BleDialDescriptorProfile BLE_DIAL_DESCRIPTOR_PROFILE = BleDialDescriptorProfile::Baseline;
 
 // BLE HID device info — extracted for metadata tuning rounds.
 constexpr uint8_t  BLE_PNP_SIG     = 0x02;    // 0x02 = USB
@@ -767,7 +865,7 @@ bool dialBackendReady() {
 #if !ARDUINO_USB_MODE
   return HID.ready();
 #elif defined(CONFIG_BLUEDROID_ENABLED)
-  return bleDialConnected && bleDialInputReport != nullptr;
+  return bleDialConnected && bleMediaInputReport != nullptr;
 #else
   return false;
 #endif
@@ -870,35 +968,125 @@ void beginDialBackend() {
   setBleDialState(BleDialState::Initializing);
   setBleLastBackendError("none");
   logBleEvent("init");
+  DIAL_SERIAL.println("[BLE-HID] init start");
+
   BLEDevice::init(USB_PRODUCT_NAME);
+
+  // --- Task A: Bonded Just Works security ---
+  {
+    BLESecurity* bleSecurity = new BLESecurity();
+#if defined(ESP_LE_AUTH_REQ_SC_BOND)
+    bleSecurity->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
+#else
+    bleSecurity->setAuthenticationMode(ESP_LE_AUTH_BOND);
+#endif
+    bleSecurity->setCapability(ESP_IO_CAP_NONE);
+    bleSecurity->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+    bleSecurity->setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+    bleSecurity->setKeySize(16);
+  }
+#if BLE_FORCE_ENCRYPTION_LEVEL
+  BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
+  DIAL_SERIAL.println("[BLE-HID] security: SC_BOND + IO_NONE + ENC");
+#else
+  DIAL_SERIAL.println("[BLE-HID] security: SC_BOND + IO_NONE");
+  DIAL_SERIAL.println("[BLE-HID] force encryption level: disabled");
+#endif
+
+  // --- Task B: stable random static address ---
+  fillBleDialRandomAddress(bleDialRandomAddress);
+  {
+    char buf[48];
+    snprintf(buf, sizeof(buf), "[BLE-HID] address: %02X:%02X:%02X:%02X:%02X:%02X",
+             bleDialRandomAddress[0], bleDialRandomAddress[1], bleDialRandomAddress[2],
+             bleDialRandomAddress[3], bleDialRandomAddress[4], bleDialRandomAddress[5]);
+    DIAL_SERIAL.println(buf);
+  }
+
+  // --- HID device setup ---
+  DIAL_SERIAL.printf("[BLE-HID] media report id: %u\n", MEDIA_REPORT_ID);
   bleDialServer = BLEDevice::createServer();
   bleDialServer->setCallbacks(new DialBleServerCallbacks());
   bleDialHid = new BLEHIDDevice(bleDialServer);
-  bleDialInputReport = bleDialHid->inputReport(DIAL_REPORT_ID);
+
+  uint16_t descLen = 0;
+  const uint8_t* desc = getDialReportDescriptor(descLen);
+  bleDialHid->reportMap(const_cast<uint8_t*>(desc), descLen);
+  DIAL_SERIAL.printf("[BLE-HID] report map size: %u\n", descLen);
+
+  // Consumer Control volume test: use MEDIA_REPORT_ID.
+  bleMediaInputReport = bleDialHid->inputReport(MEDIA_REPORT_ID);
+  DIAL_SERIAL.println("[BLE-HID] media input report created");
+
+  // --- Task E: patch descriptor permissions on media report ---
+  {
+    BLEDescriptor* rptRef = bleMediaInputReport->getDescriptorByUUID(BLEUUID((uint16_t)0x2908));
+    BLEDescriptor* cccd   = bleMediaInputReport->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+    if (rptRef) rptRef->setAccessPermissions(ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE);
+    if (cccd)   cccd->setAccessPermissions(ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE);
+    DIAL_SERIAL.printf("[BLE-HID] media descriptor permissions patched: 2908=%s, 2902=%s\n",
+                       rptRef ? "yes" : "no", cccd ? "yes" : "no");
+    if (rptRef) {
+      // Report Reference value is set by the library: {reportID, 0x01}.
+      // Should be {0x02, 0x01} for MEDIA_REPORT_ID=2.
+      uint8_t* refVal = rptRef->getValue();
+      size_t refLen = rptRef->getLength();
+      if (refVal && refLen >= 2) {
+        DIAL_SERIAL.printf("[BLE-HID] media report ref: %02X %02X\n", refVal[0], refVal[1]);
+      } else {
+        DIAL_SERIAL.printf("[BLE-HID] media report ref: missing or too short (len=%u)\n", refLen);
+      }
+    }
+  }
+
+  // TEST BRANCH: only MEDIA_REPORT_ID=2. No DIAL_REPORT_ID=1 secondary report.
+
+  // --- Task F: Device Information Service ---
   bleDialHid->manufacturer();
   bleDialHid->manufacturer(USB_MANUFACTURER_NAME);
   bleDialHid->pnp(BLE_PNP_SIG, BLE_PNP_VID, BLE_PNP_PID, USB_FW_VERSION_BCD);
   bleDialHid->hidInfo(BLE_HID_COUNTRY, BLE_HID_FLAGS);
-  uint16_t descLen = 0;
-  const uint8_t* desc = getDialReportDescriptor(descLen);
-  bleDialHid->reportMap(const_cast<uint8_t*>(desc), descLen);
+
   bleDialHid->startServices();
+  DIAL_SERIAL.println("[BLE-HID] services started");
+
   bleDialHid->setBatteryLevel(100);
+
+  // --- Task C: 3-service 16-bit advertising ---
   bleDialAdvertising = bleDialServer->getAdvertising();
-  BLEAdvertisementData bleAdvData;
-  BLEAdvertisementData bleScanRespData;
-  bleAdvData.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
-  bleAdvData.setAppearance(BLE_DIAL_APPEARANCE);
-  bleAdvData.setCompleteServices(bleDialHid->hidService()->getUUID());
-  bleScanRespData.setName(USB_PRODUCT_NAME);
-  bleDialAdvertising->setAdvertisementData(bleAdvData);
-  bleDialAdvertising->setScanResponseData(bleScanRespData);
+  {
+    BLEAdvertisementData bleAdvData;
+    BLEAdvertisementData bleScanData;
+
+    bleAdvData.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
+
+    // Appearance: Generic HID = 0x03C0 (little-endian: C0 03)
+    {
+      uint8_t appearanceAD[] = {0x03, 0x19, 0xC0, 0x03};
+      bleAdvData.addData(std::string(reinterpret_cast<char*>(appearanceAD), sizeof(appearanceAD)));
+    }
+
+    // Complete List of 16-bit Service UUIDs: HID, Battery, Device Information
+    {
+      uint8_t svcAD[] = {0x07, 0x03, 0x12, 0x18, 0x0F, 0x18, 0x0A, 0x18};
+      bleAdvData.addData(std::string(reinterpret_cast<char*>(svcAD), sizeof(svcAD)));
+    }
+
+    // Name in scan response to keep primary AD under 31 bytes
+    bleScanData.setName(USB_PRODUCT_NAME);
+
+    bleDialAdvertising->setAdvertisementData(bleAdvData);
+    bleDialAdvertising->setScanResponseData(bleScanData);
+  }
+  DIAL_SERIAL.println("[BLE-HID] adv services: 1812,180F,180A");
+
   bleDialAdvertising->setScanResponse(true);
   bleDialAdvertising->setMinPreferred(0x06);
   bleDialAdvertising->setMaxPreferred(0x12);
-  fillBleDialRandomAddress(bleDialRandomAddress);
   bleDialAdvertising->setDeviceAddress(bleDialRandomAddress, BLE_ADDR_TYPE_RANDOM);
   bleDialServer->startAdvertising();
+  DIAL_SERIAL.println("[BLE-HID] advertising started");
+
   bleDialAdvertisingActive = true;
   setBleDialState(BleDialState::Advertising);
   logBleEvent("advertising", "start");
@@ -997,6 +1185,7 @@ void emitLegacyTouchLongPress() {
   setModeText("MUTE");
   setDebugText("TOUCH", "HOLD", true);
   DIAL_SERIAL.println(">MUTE_TOGGLE");
+  sendMute();
   drawVolumeUi(currentVolume, currentModeText(), true);
 }
 
@@ -1026,6 +1215,15 @@ void handleEncoder() {
 
   bool swLow = digitalRead(PIN_ENC_SW) == LOW;
   if (swLow && !sEncSwitchWasLow) {
+    encSwitchDownMs = millis();
+    encLongPressSent = false;
+  }
+  if (swLow && !encLongPressSent && millis() - encSwitchDownMs >= LONG_PRESS_MS) {
+    encLongPressSent = true;
+    sendMute();
+  }
+  if (!swLow && sEncSwitchWasLow && !encLongPressSent) {
+    // Short press: released before LONG_PRESS_MS.
     dispatchPressPulseEvent("ENC");
   }
   sEncSwitchWasLow = swLow;
