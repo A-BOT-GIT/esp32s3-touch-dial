@@ -41,7 +41,7 @@
 // 3) tinyusb + cdc_on_boot：协议走 Serial（此时 Serial 就是 USB CDC）。
 // 4) tinyusb 且未启用 cdc_on_boot：只能退回 UART0。
 #if ARDUINO_USB_MODE
-#define DIAL_SERIAL USBSerial
+#define DIAL_SERIAL Serial
 #define DIAL_CONTROL_CHANNEL_NAME "native_usb_hwcdc"
 #define DIAL_USB_MODE_NAME "hwcdc"
 #elif ARDUINO_USB_CDC_ON_BOOT
