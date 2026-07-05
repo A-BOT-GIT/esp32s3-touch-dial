@@ -28,7 +28,7 @@
 #include "BLEHIDDevice.h"
 #include "BLESecurity.h"
 #include "BLEServer.h"
-#include <esp_random.h>
+#include <esp_gap_ble_api.h>
 #endif
 #else
 #include "USB.h"
@@ -432,6 +432,7 @@ class DialBleServerCallbacks : public BLEServerCallbacks {
     setBleDialState(BleDialState::ConnectedIdle);
     usbHidReadySeen = false;
     logBleEvent("connected");
+    DIAL_SERIAL.println(">BLE_CONNECTED");
     DIAL_SERIAL.println("[BLE-HID] connected");
     printUsbHidStatus("ble_connect");
   }
@@ -439,11 +440,15 @@ class DialBleServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer* pServer) override {
     bleDialConnected = false;
     DIAL_SERIAL.println("[BLE-HID] disconnected");
+    DIAL_SERIAL.println(">BLE_DISCONNECTED reason=unknown");
     usbHidReadySeen = false;
     resetBleDialSendTracking();
     setBleDialState(BleDialState::RestartingAdvertising);
     if (pServer) {
+      delay(300);  // Allow BLE stack to settle before re-advertising.
+      DIAL_SERIAL.println(">BLE_ADV_START reason=disconnect");
       pServer->startAdvertising();
+      DIAL_SERIAL.println(">BLE_ADV_OK");
       bleDialAdvertisingActive = true;
       setBleDialState(BleDialState::Advertising);
     }
@@ -929,6 +934,7 @@ void beginDialBackend() {
   logBleEvent("init");
   DIAL_SERIAL.println("[BLE-HID] init start");
 
+  DIAL_SERIAL.println(">BLE_BOOT product=ESP32-S3 Radial MVP");
   BLEDevice::init(USB_PRODUCT_NAME);
 
   // --- Task A: Bonded Just Works security ---
@@ -950,6 +956,7 @@ void beginDialBackend() {
 #else
   DIAL_SERIAL.println("[BLE-HID] security: SC_BOND + IO_NONE");
   DIAL_SERIAL.println("[BLE-HID] force encryption level: disabled");
+  DIAL_SERIAL.println(">BLE_SECURITY sc_bond_io_none force_encrypt=0");
 #endif
 
   // --- Task B: stable random static address ---
@@ -960,6 +967,10 @@ void beginDialBackend() {
              bleDialRandomAddress[0], bleDialRandomAddress[1], bleDialRandomAddress[2],
              bleDialRandomAddress[3], bleDialRandomAddress[4], bleDialRandomAddress[5]);
     DIAL_SERIAL.println(buf);
+    DIAL_SERIAL.printf(">BLE_ADDR %02X:%02X:%02X:%02X:%02X:%02X\n",
+                       bleDialRandomAddress[0], bleDialRandomAddress[1],
+                       bleDialRandomAddress[2], bleDialRandomAddress[3],
+                       bleDialRandomAddress[4], bleDialRandomAddress[5]);
   }
 
   // --- HID device setup ---
@@ -1004,6 +1015,7 @@ void beginDialBackend() {
 
   bleDialHid->startServices();
   DIAL_SERIAL.println("[BLE-HID] services started");
+  DIAL_SERIAL.println(">BLE_SERVICES_READY hid=1 battery=1 dis=1");
 
   bleDialHid->setBatteryLevel(100);
 
@@ -1039,7 +1051,9 @@ void beginDialBackend() {
   bleDialAdvertising->setMinPreferred(0x06);
   bleDialAdvertising->setMaxPreferred(0x12);
   bleDialAdvertising->setDeviceAddress(bleDialRandomAddress, BLE_ADDR_TYPE_RANDOM);
+  DIAL_SERIAL.println(">BLE_ADV_START reason=boot");
   bleDialServer->startAdvertising();
+  DIAL_SERIAL.println(">BLE_ADV_OK");
   DIAL_SERIAL.println("[BLE-HID] advertising started");
 
   bleDialAdvertisingActive = true;
@@ -1281,6 +1295,29 @@ void handleLine(const char* line) {
     dispatchPressPulseEvent("SIM");
     return;
   }
+  if (strcmp(line, "BLE STATUS") == 0) {
+#if ARDUINO_USB_MODE && defined(CONFIG_BLUEDROID_ENABLED)
+    int bondedCount = esp_ble_get_bond_device_num();
+    DIAL_SERIAL.printf(
+        ">BLE_STATUS product=\"%s\" addr=%02X:%02X:%02X:%02X:%02X:%02X "
+        "connected=%d advertising=%d bonded_count=%d "
+        "security=\"SC_BOND+IO_NONE\" force_encrypt=0 "
+        "uptime_ms=%lu backend=%s\n",
+        USB_PRODUCT_NAME,
+        bleDialRandomAddress[0], bleDialRandomAddress[1],
+        bleDialRandomAddress[2], bleDialRandomAddress[3],
+        bleDialRandomAddress[4], bleDialRandomAddress[5],
+        bleDialConnected ? 1 : 0,
+        bleDialAdvertisingActive ? 1 : 0,
+        bondedCount,
+        (unsigned long)millis(),
+        bleDialStateName());
+#else
+    DIAL_SERIAL.println(">BLE_STATUS backend=none");
+#endif
+    return;
+  }
+
   if (strcmp(line, "ENC STATUS") == 0) {
     DIAL_SERIAL.printf(">ENC_STATUS mode=%s debug=%s volume=%d hid=%s backend=%s backend_status=%s ble_connected=%d ble_advertising=%d last_send_type=%s\n",
                        currentModeText(),
@@ -1328,7 +1365,10 @@ void readSerialLines() {
 
 void setup() {
   DIAL_SERIAL.begin(115200);
-  delay(20);
+  // Wait for USB CDC enumeration (TinyUSB/HWCDC may need 1-3s).
+  delay(1500);
+  uint32_t start = millis();
+  while (!Serial && millis() - start < 3000) delay(10);
   probeLog("setup.begin");
   beginDialBackend();
   probeLog("after.hidBegin");
