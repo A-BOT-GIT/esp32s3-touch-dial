@@ -15,6 +15,27 @@ Windows 可能需要额外安装 hidapi DLL。从 [Releases](https://github.com/
 
 ## 使用
 
+### 中文入口
+
+推荐优先使用仓库内的中文入口：
+
+```cmd
+python tools\win_raw_hid_probe\raw_hid_listener_cn.py list
+python tools\win_raw_hid_probe\raw_hid_listener_cn.py listen
+```
+
+默认行为：
+
+- `list`：列出并打分所有 HID 设备，优先标记疑似 `ESP32-S3 Radial MVP`
+- `listen`：默认按名称 `ESP32` 搜索并监听
+
+如需精确指定：
+
+```cmd
+python tools\win_raw_hid_probe\raw_hid_listener_cn.py listen --path "\\?\HID#..."
+python tools\win_raw_hid_probe\raw_hid_listener_cn.py listen --vid 303A --pid 1001
+```
+
 ### 1. 列出 HID 设备
 
 ```cmd
@@ -40,26 +61,33 @@ python tools\win_raw_hid_probe\hid_probe.py listen --path "\\?\HID#..." --timeou
 监听启动后，旋转和按压编码器。应看到类似输出：
 
 ```
-[16:55:01.123] #0001 len=2  02 00
-               button=0 dial=+1  (raw=0x0002)
-[16:55:02.456] #0002 len=2  FE FF
-               button=0 dial=-1  (raw=0xFFFE)
-[16:55:03.789] #0003 len=2  01 00
-               button=1 dial=+0  (raw=0x0001)
-[16:55:04.111] #0004 len=2  00 00
-               button=0 dial=+0  (raw=0x0000)
+[00:00:29.236] #0001 len=3  00 64 00
+               button=0 dial=+100 (+10.0 deg)  (raw=00 64 00)
+[00:00:30.657] #0002 len=3  00 9C FF
+               button=0 dial=-100 (-10.0 deg)  (raw=00 9C FF)
+[00:00:32.232] #0003 len=3  01 00 00
+               button=1 dial=+0 (+0.0 deg)  (raw=01 00 00)
+[00:00:32.240] #0004 len=3  00 00 00
+               button=0 dial=+0 (+0.0 deg)  (raw=00 00 00)
 ```
 
 ### 预期 report
 
 | ESP32 操作 | 期望 bytes |
 |-----------|-----------|
-| 旋转右 (+15) | `1E 00` |
-| 旋转左 (-15) | `E2 FF` |
-| 按下 | `01 00` |
-| 释放 | `00 00` |
-| 按下+右转 | `1F 00` |
-| 按下+左转 | `E3 FF` |
+| 旋转右 (+10.0 deg) | `00 64 00` |
+| 旋转左 (-10.0 deg) | `00 9C FF` |
+| 按下 | `01 00 00` |
+| 释放 | `00 00 00` |
+| 按下+右转 | `01 64 00` |
+| 按下+左转 | `01 9C FF` |
+
+说明：
+
+- 当前固件 HID Input Report 已调整为 3 字节格式：
+  - byte0: button
+  - byte1-2: signed 16-bit dial delta (0.1 degree units)
+- 当前调校值为每步 `10.0°`，所以单步旋转对应 `+100 / -100`
 
 ## 常见问题
 

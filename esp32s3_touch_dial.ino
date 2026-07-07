@@ -26,6 +26,7 @@
 #include "BLEAdvertising.h"
 #include "BLEDevice.h"
 #include "BLEHIDDevice.h"
+#include "BLE2902.h"
 #include "BLESecurity.h"
 #include "BLEServer.h"
 #include <esp_gap_ble_api.h>
@@ -104,9 +105,11 @@ constexpr unsigned long PRESS_DEBOUNCE_MS = 300;
 
 constexpr uint8_t DIAL_REPORT_ID = 1;  // Radial Controller requires non-zero Report ID
 constexpr uint8_t RADIAL_REPORT_ID = 1;
-// Degrees per encoder detent in 0.1° units.  Trial: 60 = 6.0° per step.
-constexpr int16_t RADIAL_DETENT_TENTHS_DEG = 60;
+// Degrees per encoder detent in 0.1° units.
+// Tuned to 10.0° per detent for a balance between responsiveness and control.
+constexpr int16_t RADIAL_DETENT_TENTHS_DEG = 100;
 constexpr uint8_t DIAL_BUTTON_PRESS = 0x01;
+constexpr unsigned long RADIAL_TEST_HOLD_MS = 2000;
 constexpr int8_t DIAL_ROTATE_RIGHT = 1;
 constexpr int8_t DIAL_ROTATE_LEFT = -1;
 
@@ -125,8 +128,9 @@ enum class BleDialDescriptorProfile : uint8_t {
 // Default: Radial Controller minimal descriptor per task doc.
 constexpr BleDialDescriptorProfile BLE_DIAL_DESCRIPTOR_PROFILE = BleDialDescriptorProfile::Baseline;
 
-// Radial Controller report map (v1.2 spec).
-// System Multi-Axis Controller + Digitizers/Puck + Button 1 + Dial (15-bit).
+// Radial Controller report map.
+// Keep the same usages, but align button and dial onto byte boundaries:
+// 1-bit button + 7-bit padding + 16-bit relative dial.
 static const uint8_t radialControllerReportMap[] = {
   0x05, 0x01,        // Usage Page (Generic Desktop)
   0x09, 0x0E,        // Usage (System Multi-Axis Controller)
@@ -142,10 +146,13 @@ static const uint8_t radialControllerReportMap[] = {
   0x15, 0x00,        //     Logical Min (0)
   0x25, 0x01,        //     Logical Max (1)
   0x81, 0x02,        //     Input (Data, Var, Abs)
+  0x95, 0x01,        //     Report Count (1)
+  0x75, 0x07,        //     Report Size (7)
+  0x81, 0x03,        //     Input (Const, Var, Abs)
   0x05, 0x01,        //     Usage Page (Generic Desktop)
   0x09, 0x37,        //     Usage (Dial)
   0x95, 0x01,        //     Report Count (1)
-  0x75, 0x0F,        //     Report Size (15)
+  0x75, 0x10,        //     Report Size (16)
   0x55, 0x0F,        //     Unit Exponent (-1)
   0x65, 0x14,        //     Unit (Degrees, English Rotation)
   0x36, 0xF0, 0xF1,  //     Physical Min (-3600)
@@ -181,6 +188,8 @@ BLEHIDDevice* bleDialHid = nullptr;
 BLEAdvertising* bleDialAdvertising = nullptr;
 BLECharacteristic* bleDialInputReport = nullptr;
 BLECharacteristic* bleRadialInputReport = nullptr;
+BLEService* bleDiagService = nullptr;
+BLECharacteristic* bleDiagNotifyChar = nullptr;
 esp_bd_addr_t bleDialRandomAddress = {0};
 bool bleDialConnected = false;
 bool bleDialAdvertisingActive = false;
@@ -191,6 +200,23 @@ unsigned long bleLastSendMs = 0;
 unsigned long bleLastRotateSendMs = 0;
 unsigned long bleLastPressSendMs = 0;
 #endif
+
+// ── Runtime diagnostic feature flags ────────────────────────────────
+bool gLogQuiet         = false;  // suppress periodic HELLO/PROBE
+bool gDiagCccd         = false;  // notify_enabled gating + extra CCCD logs
+bool gDiagNotify       = false;  // RADIAL_NOTIFY detailed log format
+bool gDiagHidstat      = false;  // enhanced HID STATUS fields
+
+// ── CCCD / notify / report tracking variables ──────────────────────
+bool        bleRadialNotifyEnabled = false;
+uint8_t     bleRadialCccdValue[2]  = {0, 0};
+unsigned long bleLastCccdWriteMs   = 0;
+uint32_t    bleHidSentCount        = 0;
+uint32_t    bleHidSkipCount        = 0;
+uint8_t     bleLastReportData[4]   = {0, 0, 0, 0};
+uint8_t     bleLastReportLen       = 0;
+const char* bleLastNotifyResult    = "none";
+unsigned long bleLastNotifyMs      = 0;
 
 // Button state used by handleEncoder (outside BLE guard).
 bool radialButtonPressed = false;
@@ -281,33 +307,54 @@ void restoreBleDialStableState() {
 }
 
 // --- Task E: Radial payload packing ---
-// bit0 = button, bit1-15 = signed 15-bit dial delta.
-uint16_t buildRadialPayload(bool pressed, int16_t deltaTenthsDegree) {
+// byte0 bit0 = button, byte0 bit1-7 = padding, byte1-2 = signed 16-bit dial delta.
+int16_t clampRadialDelta(int16_t deltaTenthsDegree) {
   if (deltaTenthsDegree < -3600) deltaTenthsDegree = -3600;
   if (deltaTenthsDegree >  3600) deltaTenthsDegree =  3600;
-  uint16_t dial15 = static_cast<uint16_t>(deltaTenthsDegree) & 0x7FFF;
-  return static_cast<uint16_t>((dial15 << 1) | (pressed ? 1 : 0));
+  return deltaTenthsDegree;
 }
 
 // --- Task F: Radial report sender ---
-// 2-byte BLE notify value, NO Report ID in payload.
+// 3-byte BLE notify value, NO Report ID in payload.
 bool sendRadialReport(bool pressed, int16_t delta) {
-  if (!bleDialConnected || !bleRadialInputReport) {
-    DIAL_SERIAL.printf(">BLE radial report skip button=%d delta=%d connected=%d report=%d\n",
-                       pressed ? 1 : 0, delta,
-                       bleDialConnected ? 1 : 0,
-                       bleRadialInputReport ? 1 : 0);
+  if (!bleDialConnected) {
+    DIAL_SERIAL.println(">RADIAL_NOTIFY skip reason=not_connected");
+    bleHidSkipCount++; bleLastNotifyResult="not_connected"; bleLastNotifyMs=millis();
     return false;
   }
-  uint16_t payload = buildRadialPayload(pressed, delta);
-  uint8_t report[2] = {
-    static_cast<uint8_t>(payload & 0xFF),
-    static_cast<uint8_t>((payload >> 8) & 0xFF)
+  if (!bleRadialInputReport) {
+    DIAL_SERIAL.println(">RADIAL_NOTIFY skip reason=no_report_char");
+    bleHidSkipCount++; bleLastNotifyResult="no_report_char"; bleLastNotifyMs=millis();
+    return false;
+  }
+  if (gDiagCccd && !bleRadialNotifyEnabled) {
+    DIAL_SERIAL.println(">RADIAL_NOTIFY skip reason=cccd_disabled");
+    bleHidSkipCount++; bleLastNotifyResult="cccd_disabled"; bleLastNotifyMs=millis();
+    return false;
+  }
+  int16_t clampedDelta = clampRadialDelta(delta);
+  uint8_t report[3] = {
+    static_cast<uint8_t>(pressed ? 0x01 : 0x00),
+    static_cast<uint8_t>(clampedDelta & 0xFF),
+    static_cast<uint8_t>((clampedDelta >> 8) & 0xFF)
   };
+  bleLastReportData[0] = report[0];
+  bleLastReportData[1] = report[1];
+  bleLastReportData[2] = report[2];
+  bleLastReportData[3] = 0x00;
+  bleLastReportLen = 3;
+  bleHidSentCount++;
+  if (gDiagNotify) {
+    DIAL_SERIAL.printf(">RADIAL_NOTIFY uuid=2A4D report_ref=01 01 len=3 data=%02X %02X %02X button=%d delta=%d connected=1 notify_enabled=%d\n",
+                       report[0], report[1], report[2], pressed ? 1 : 0, delta, bleRadialNotifyEnabled ? 1 : 0);
+  } else {
+    DIAL_SERIAL.printf(">BLE radial report len=3 data=%02X %02X %02X button=%d delta=%d hid=sent\n",
+                       report[0], report[1], report[2], pressed ? 1 : 0, delta);
+  }
   bleRadialInputReport->setValue(report, sizeof(report));
   bleRadialInputReport->notify();
-  DIAL_SERIAL.printf(">BLE radial report len=2 data=%02X %02X button=%d delta=%d hid=sent\n",
-                     report[0], report[1], pressed ? 1 : 0, delta);
+  if (gDiagNotify) DIAL_SERIAL.println(">RADIAL_NOTIFY called");
+  bleLastNotifyResult="called"; bleLastNotifyMs=millis();
   return true;
 }
 
@@ -350,6 +397,34 @@ bool bleDialSendReport(uint8_t buttons, int8_t delta, const char* sendType) {
 
   restoreBleDialStableState();
   return true;
+}
+
+bool sendDiagNotifyTest() {
+  if (!bleDialConnected) {
+    DIAL_SERIAL.println(">DIAG_GATTTEST skip reason=not_connected");
+    return false;
+  }
+  if (!bleDiagNotifyChar) {
+    DIAL_SERIAL.println(">DIAG_GATTTEST skip reason=no_diag_char");
+    return false;
+  }
+  uint8_t payload[2] = {0xAA, 0x55};
+  bleDiagNotifyChar->setValue(payload, sizeof(payload));
+  bleDiagNotifyChar->notify();
+  DIAL_SERIAL.println(">DIAG_GATTTEST uuid=6B1D0002 len=2 data=AA 55");
+  DIAL_SERIAL.println(">DIAG_GATTTEST called");
+  return true;
+}
+
+void printDiagGattStatus() {
+  BLEService* lookupService = bleDialServer ? bleDialServer->getServiceByUUID(BLEUUID("6B1D0001-7E57-4A5A-8C6C-5F3E2B917101")) : nullptr;
+  DIAL_SERIAL.printf(">DIAG_GATT_STATUS server=%d service_ptr=%d char_ptr=%d lookup=%d connected=%d advertising=%d\n",
+                     bleDialServer ? 1 : 0,
+                     bleDiagService ? 1 : 0,
+                     bleDiagNotifyChar ? 1 : 0,
+                     lookupService ? 1 : 0,
+                     bleDialConnected ? 1 : 0,
+                     bleDialAdvertisingActive ? 1 : 0);
 }
 #endif
 
@@ -441,6 +516,12 @@ class DialBleServerCallbacks : public BLEServerCallbacks {
     bleDialConnected = false;
     DIAL_SERIAL.println("[BLE-HID] disconnected");
     DIAL_SERIAL.println(">BLE_DISCONNECTED reason=unknown");
+    bleRadialNotifyEnabled = false;
+    bleRadialCccdValue[0] = 0; bleRadialCccdValue[1] = 0;
+    bleLastCccdWriteMs = 0;
+    if (gDiagCccd) {
+      DIAL_SERIAL.println(">CCCD_RESET reason=disconnect notify_enabled=0");
+    }
     usbHidReadySeen = false;
     resetBleDialSendTracking();
     setBleDialState(BleDialState::RestartingAdvertising);
@@ -455,6 +536,28 @@ class DialBleServerCallbacks : public BLEServerCallbacks {
     logBleEvent("disconnected");
     logBleEvent("advertising", "restart");
     printUsbHidStatus("ble_disconnect");
+  }
+};
+
+class DialRadialCccdCallbacks : public BLEDescriptorCallbacks {
+ public:
+  void onWrite(BLEDescriptor* pDescriptor) override {
+    uint8_t* val = pDescriptor->getValue();
+    size_t len = pDescriptor->getLength();
+    if (val && len >= 2) {
+      bleRadialCccdValue[0] = val[0];
+      bleRadialCccdValue[1] = val[1];
+      bleLastCccdWriteMs = millis();
+      bleRadialNotifyEnabled = (val[0] == 0x01 && val[1] == 0x00);
+      if (gDiagCccd) {
+        DIAL_SERIAL.printf(">CCCD_WRITE uuid=2A4D value=%02X %02X notify_enabled=%d\n",
+                           val[0], val[1], bleRadialNotifyEnabled ? 1 : 0);
+      }
+    } else {
+      if (gDiagCccd) {
+        DIAL_SERIAL.printf(">CCCD_WRITE uuid=2A4D invalid len=%u\n", (unsigned)len);
+      }
+    }
   }
 };
 #endif
@@ -522,6 +625,8 @@ constexpr uint16_t BLE_PNP_VID     = 0x303A;   // Espressif
 constexpr uint16_t BLE_PNP_PID     = 0x1001;
 constexpr uint8_t  BLE_HID_COUNTRY = 0x00;    // Not localized
 constexpr uint8_t  BLE_HID_FLAGS   = 0x01;    // RemoteWake + NormallyConnectable
+constexpr char BLE_DIAG_SERVICE_UUID[] = "6B1D0001-7E57-4A5A-8C6C-5F3E2B917101";
+constexpr char BLE_DIAG_NOTIFY_UUID[]  = "6B1D0002-7E57-4A5A-8C6C-5F3E2B917101";
 
 uint16_t volumeColor(int volume) {
   (void)volume;
@@ -851,21 +956,57 @@ void printUsbHidStatus(const char* reason) {
       USB_PRODUCT_NAME,
       dialBackendNote());
 #else
-  DIAL_SERIAL.printf(
-      ">HID_STATUS reason=%s usb_mode=%s cdc_on_boot=%d control_channel=%s hid_supported=0 usb_started=0 hid_ready=0 dial_backend=%s dial_backend_ready=%d backend_status=%s ble_connected=%d ble_advertising=%d product=%s note=%s last_backend_error=%s last_send_type=%s\n",
-      reason,
-      DIAL_USB_MODE_NAME,
-      ARDUINO_USB_CDC_ON_BOOT,
-      DIAL_CONTROL_CHANNEL_NAME,
-      dialBackendName(),
-      dialBackendReady() ? 1 : 0,
-      dialBackendStatus(),
-      bleDialConnected ? 1 : 0,
-      bleDialAdvertisingActive ? 1 : 0,
-      USB_PRODUCT_NAME,
-      dialBackendNote(),
-      bleLastBackendError,
-      bleLastSendType);
+  if (gDiagHidstat) {
+    DIAL_SERIAL.printf(
+        ">HID_STATUS reason=%s usb_mode=%s cdc_on_boot=%d control_channel=%s "
+        "hid_supported=0 usb_started=0 hid_ready=0 "
+        "dial_backend=%s dial_backend_ready=%d backend_status=%s "
+        "ble_connected=%d ble_advertising=%d "
+        "notify_enabled=%d cccd_value=%02X%02X last_cccd_write_ms=%lu "
+        "report_char_uuid=2A4D report_ref=0101 "
+        "last_report_len=%u last_report_data=%02X %02X %02X %02X "
+        "hid_sent_count=%u hid_skip_count=%u "
+        "last_notify_result=%s "
+        "product=%s note=%s last_backend_error=%s last_send_type=%s\n",
+        reason,
+        DIAL_USB_MODE_NAME,
+        ARDUINO_USB_CDC_ON_BOOT,
+        DIAL_CONTROL_CHANNEL_NAME,
+        dialBackendName(),
+        dialBackendReady() ? 1 : 0,
+        dialBackendStatus(),
+        bleDialConnected ? 1 : 0,
+        bleDialAdvertisingActive ? 1 : 0,
+        bleRadialNotifyEnabled ? 1 : 0,
+        bleRadialCccdValue[0], bleRadialCccdValue[1],
+        (unsigned long)bleLastCccdWriteMs,
+        (unsigned int)bleLastReportLen,
+        bleLastReportData[0], bleLastReportData[1],
+        bleLastReportData[2], bleLastReportData[3],
+        (unsigned int)bleHidSentCount,
+        (unsigned int)bleHidSkipCount,
+        bleLastNotifyResult,
+        USB_PRODUCT_NAME,
+        dialBackendNote(),
+        bleLastBackendError,
+        bleLastSendType);
+  } else {
+    DIAL_SERIAL.printf(
+        ">HID_STATUS reason=%s usb_mode=%s cdc_on_boot=%d control_channel=%s hid_supported=0 usb_started=0 hid_ready=0 dial_backend=%s dial_backend_ready=%d backend_status=%s ble_connected=%d ble_advertising=%d product=%s note=%s last_backend_error=%s last_send_type=%s\n",
+        reason,
+        DIAL_USB_MODE_NAME,
+        ARDUINO_USB_CDC_ON_BOOT,
+        DIAL_CONTROL_CHANNEL_NAME,
+        dialBackendName(),
+        dialBackendReady() ? 1 : 0,
+        dialBackendStatus(),
+        bleDialConnected ? 1 : 0,
+        bleDialAdvertisingActive ? 1 : 0,
+        USB_PRODUCT_NAME,
+        dialBackendNote(),
+        bleLastBackendError,
+        bleLastSendType);
+  }
 #endif
 }
 
@@ -993,7 +1134,12 @@ void beginDialBackend() {
     BLEDescriptor* rptRef = bleRadialInputReport->getDescriptorByUUID(BLEUUID((uint16_t)0x2908));
     BLEDescriptor* cccd   = bleRadialInputReport->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
     if (rptRef) rptRef->setAccessPermissions(ESP_GATT_PERM_READ);  // ReportRef: read-only
-    if (cccd)   cccd->setAccessPermissions(ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE);
+    if (cccd) {
+      cccd->setAccessPermissions(ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE);
+      DIAL_SERIAL.printf("[BLE-HID] CCCD perm=0x%02X\n", ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE);
+      cccd->setCallbacks(new DialRadialCccdCallbacks());
+      DIAL_SERIAL.println("[BLE-HID] CCCD callback mounted");
+    }
     DIAL_SERIAL.printf("[BLE-HID] descriptor permissions patched: 2908=%s, 2902=%s\n",
                        rptRef ? "yes" : "no", cccd ? "yes" : "no");
     if (rptRef) {
@@ -1013,9 +1159,23 @@ void beginDialBackend() {
   bleDialHid->pnp(BLE_PNP_SIG, BLE_PNP_VID, BLE_PNP_PID, USB_FW_VERSION_BCD);
   bleDialHid->hidInfo(BLE_HID_COUNTRY, BLE_HID_FLAGS);
 
+  // Minimal custom notify path for isolating BLE notify delivery from HID.
+  bleDiagService = bleDialServer->createService(BLEUUID(BLE_DIAG_SERVICE_UUID));
+  bleDiagNotifyChar = bleDiagService->createCharacteristic(
+      BLEUUID(BLE_DIAG_NOTIFY_UUID),
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  bleDiagNotifyChar->addDescriptor(new BLE2902());
+  {
+    uint8_t initPayload[2] = {0x00, 0x00};
+    bleDiagNotifyChar->setValue(initPayload, sizeof(initPayload));
+  }
+  bleDiagService->start();
+  DIAL_SERIAL.println("[BLE-DIAG] custom notify service started");
+  DIAL_SERIAL.println(">BLE_DIAG_SERVICE_READY uuid=6B1D0001 char=6B1D0002");
+
   bleDialHid->startServices();
   DIAL_SERIAL.println("[BLE-HID] services started");
-  DIAL_SERIAL.println(">BLE_SERVICES_READY hid=1 battery=1 dis=1");
+  DIAL_SERIAL.println(">BLE_SERVICES_READY hid=1 battery=1 dis=1 diag=1");
 
   bleDialHid->setBatteryLevel(100);
 
@@ -1096,7 +1256,12 @@ bool dialBackendSendPressPulse() {
 #elif defined(CONFIG_BLUEDROID_ENABLED)
   setBleDialState(BleDialState::SendingPress);
   logBleEvent("report", "press");
-  return bleDialSendReport(DIAL_BUTTON_PRESS, 0, "press");
+  radialButtonPressed = true;
+  bool ok1 = sendRadialReport(true, 0);
+  delay(100);
+  radialButtonPressed = false;
+  bool ok2 = sendRadialReport(false, 0);
+  return ok1 && ok2;
 #else
   return bleDialBackendBegun && dialBackendReady();
 #endif
@@ -1278,6 +1443,96 @@ void enterWaitPc() {
 }
 
 void handleLine(const char* line) {
+  // ── DIAG runtime feature switches ────────────────────────────────
+  if (strcmp(line, "DIAG CCCD ON") == 0) {
+    gDiagCccd = true; DIAL_SERIAL.println(">DIAG cccd=1"); return;
+  }
+  if (strcmp(line, "DIAG CCCD OFF") == 0) {
+    gDiagCccd = false; DIAL_SERIAL.println(">DIAG cccd=0"); return;
+  }
+  if (strcmp(line, "DIAG NOTIFY ON") == 0) {
+    gDiagNotify = true; DIAL_SERIAL.println(">DIAG notify=1"); return;
+  }
+  if (strcmp(line, "DIAG NOTIFY OFF") == 0) {
+    gDiagNotify = false; DIAL_SERIAL.println(">DIAG notify=0"); return;
+  }
+  if (strcmp(line, "DIAG HIDSTAT ON") == 0) {
+    gDiagHidstat = true; DIAL_SERIAL.println(">DIAG hidstat=1"); return;
+  }
+  if (strcmp(line, "DIAG HIDSTAT OFF") == 0) {
+    gDiagHidstat = false; DIAL_SERIAL.println(">DIAG hidstat=0"); return;
+  }
+  if (strcmp(line, "DIAG ALL ON") == 0) {
+    gDiagCccd = gDiagNotify = gDiagHidstat = true;
+    DIAL_SERIAL.println(">DIAG all=1"); return;
+  }
+  if (strcmp(line, "DIAG ALL OFF") == 0) {
+    gDiagCccd = gDiagNotify = gDiagHidstat = false;
+    DIAL_SERIAL.println(">DIAG all=0"); return;
+  }
+  if (strcmp(line, "DIAG STATUS") == 0) {
+    DIAL_SERIAL.printf(">DIAG_STATUS cccd=%d notify=%d hidstat=%d log_quiet=%d sent=%u skip=%u notify_enabled=%d cccd_val=%02X%02X last_result=%s\n",
+                       gDiagCccd?1:0, gDiagNotify?1:0, gDiagHidstat?1:0,
+                       gLogQuiet?1:0, (unsigned)bleHidSentCount, (unsigned)bleHidSkipCount,
+                       bleRadialNotifyEnabled?1:0, bleRadialCccdValue[0], bleRadialCccdValue[1],
+                       bleLastNotifyResult);
+    return;
+  }
+  if (strcmp(line, "DIAG GATT STATUS") == 0) {
+#if ARDUINO_USB_MODE && defined(CONFIG_BLUEDROID_ENABLED)
+    printDiagGattStatus();
+#else
+    DIAL_SERIAL.println(">DIAG_GATT_STATUS backend=none");
+#endif
+    return;
+  }
+  // ── LOG control ──────────────────────────────────────────────────
+  if (strcmp(line, "LOG QUIET") == 0) {
+    gLogQuiet = true; DIAL_SERIAL.println(">LOG_QUIET"); return;
+  }
+  if (strcmp(line, "LOG VERBOSE") == 0) {
+    gLogQuiet = false; DIAL_SERIAL.println(">LOG_VERBOSE"); return;
+  }
+  // ── RADIAL TEST ──────────────────────────────────────────────────
+  if (strcmp(line, "RADIAL TEST CW") == 0) {
+    DIAL_SERIAL.printf(">RADIAL_TEST name=CW scaled=%d\n", RADIAL_DETENT_TENTHS_DEG);
+    sendRadialReport(false, +RADIAL_DETENT_TENTHS_DEG);
+    return;
+  }
+  if (strcmp(line, "RADIAL TEST CCW") == 0) {
+    DIAL_SERIAL.printf(">RADIAL_TEST name=CCW scaled=%d\n", -RADIAL_DETENT_TENTHS_DEG);
+    sendRadialReport(false, -RADIAL_DETENT_TENTHS_DEG);
+    return;
+  }
+  if (strcmp(line, "RADIAL TEST DOWN") == 0) {
+    DIAL_SERIAL.println(">RADIAL_TEST name=DOWN"); radialButtonPressed=true; sendRadialReport(true, 0); return;
+  }
+  if (strcmp(line, "RADIAL TEST UP") == 0) {
+    DIAL_SERIAL.println(">RADIAL_TEST name=UP"); radialButtonPressed=false; sendRadialReport(false, 0); return;
+  }
+  if (strcmp(line, "RADIAL TEST TAP") == 0) {
+    DIAL_SERIAL.println(">RADIAL_TEST name=TAP"); dispatchPressPulseEvent("SIM_TAP"); return;
+  }
+  if (strcmp(line, "RADIAL TEST HOLD") == 0) {
+    DIAL_SERIAL.println(">RADIAL_TEST name=HOLD");
+    radialButtonPressed = true;
+    sendRadialReport(true, 0);
+    DIAL_SERIAL.printf(">RADIAL_TEST hold_ms=%lu stage=down\n", (unsigned long)RADIAL_TEST_HOLD_MS);
+    delay(RADIAL_TEST_HOLD_MS);
+    radialButtonPressed = false;
+    sendRadialReport(false, 0);
+    DIAL_SERIAL.println(">RADIAL_TEST stage=up");
+    return;
+  }
+  if (strcmp(line, "DIAG NOTIFY TEST") == 0) {
+    DIAL_SERIAL.println(">DIAG_GATTTEST name=AA55");
+#if ARDUINO_USB_MODE && defined(CONFIG_BLUEDROID_ENABLED)
+    sendDiagNotifyTest();
+#else
+    DIAL_SERIAL.println(">DIAG_GATTTEST skip reason=ble_build_disabled");
+#endif
+    return;
+  }
   if (strcmp(line, "ACK") == 0) {
     lastAckMs = millis();
     enterWired();
@@ -1432,7 +1687,7 @@ void loop() {
   unsigned long now = millis();
   if (now - lastLoopProbeMs >= 3000) {
     lastLoopProbeMs = now;
-    probeLog(wired ? "loop.wired" : "loop.wait_pc");
+    if (!gLogQuiet) probeLog(wired ? "loop.wired" : "loop.wait_pc");
   }
   if (usbHidReadySeen && !dialBackendReady()) {
     usbHidReadySeen = false;
@@ -1450,7 +1705,7 @@ void loop() {
   if (!wired) {
     if (now - lastHelloMs >= HELLO_INTERVAL_MS) {
       lastHelloMs = now;
-      DIAL_SERIAL.println(">HELLO");
+      if (!gLogQuiet) DIAL_SERIAL.println(">HELLO");
     }
     return;
   }
@@ -1465,4 +1720,3 @@ void loop() {
     DIAL_SERIAL.println(">PING");
   }
 }
-

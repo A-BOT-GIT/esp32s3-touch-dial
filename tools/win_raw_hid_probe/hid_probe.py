@@ -51,24 +51,22 @@ SEARCH_KEYWORDS = [
 # HID Report Parser
 # ---------------------------------------------------------------------------
 def parse_radial_payload(data: bytes) -> str:
-    """Parse 2-byte Radial Controller payload.
-    bit0         = button
-    bit1..bit15  = signed 15-bit dial delta
+    """Parse 3-byte Radial Controller payload.
+
+    byte0 bit0   = button
+    byte0 bit1-7 = padding
+    byte1-2      = signed 16-bit dial delta in 0.1 degree units
     """
-    if len(data) < 2:
+    if len(data) < 3:
         return f"({len(data)} bytes, too short for radial)"
 
-    payload = struct.unpack("<H", data[:2])[0]
-    button = payload & 0x01
-    dial_raw = (payload >> 1) & 0x7FFF
-
-    # Sign-extend 15-bit to Python int
-    if dial_raw & 0x4000:
-        dial_signed = dial_raw - 0x8000
-    else:
-        dial_signed = dial_raw
-
-    return f"button={button} dial={dial_signed:+d}  (raw=0x{payload:04X})"
+    button = data[0] & 0x01
+    dial_signed = struct.unpack("<h", data[1:3])[0]
+    dial_deg = dial_signed / 10.0
+    return (
+        f"button={button} dial={dial_signed:+d} ({dial_deg:+.1f} deg)  "
+        f"(raw={data[0]:02X} {data[1]:02X} {data[2]:02X})"
+    )
 
 
 # ---------------------------------------------------------------------------
